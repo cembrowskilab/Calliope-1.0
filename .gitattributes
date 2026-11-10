@@ -1,0 +1,15 @@
+# Normalise line endings across Windows/macOS/Linux so contributors
+# don't churn the diff on commit. Text files are stored and checked out
+# with LF line endings on every platform (``eol=lf``).
+* text=auto eol=lf
+
+# Binary assets -- don't try to normalise these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.tif binary
+*.tiff binary
+*.npy binary
+*.pt binary

@@ -1,0 +1,521 @@
+"""summary_writer.py - cross-recording XLSX summary file.
+
+What this file does, in one paragraph
+-------------------------------------
+As the user works through the pipeline, each tab incrementally adds
+or refreshes a sheet in a single Excel workbook,
+``<plane0>/calliope_summary.xlsx``. Tab 3 fills in the ROI table, Tab
+5 writes the event windows and per-ROI onset times, Tab 6 writes
+cluster assignments. Sheets written by other tabs are preserved on
+rewrite, so the workbook is the single source of truth for "what did
+we do to this recording".
+
+Why a workbook and not just NumPy files?
+- Users often want to reopen the data in Excel / GraphPad to
+  sanity-check it.
+- The sheet layout is also the cross-recording comparison format: a
+  separate analysis script can glob every recording's
+  ``calliope_summary.xlsx`` and stack the EventOnsets sheets into a
+  single tidy table.
+
+Sheet conventions
+-----------------
+- ``Recording``: single key/value table (recording_id, plane0, prefix,
+  fps, T, N, generated_at). Refreshed by Tab 3 (detection), Tab 5
+  (event detection) and Tab 6 (clustering), GUI and headless paths.
+- ``ROIs``: one row per ROI from the Suite2p detection tab.
+- ``FilterParams``: filter knobs from the Low-pass tab (key/value).
+  RESERVED -- ``write_filter_params_sheet`` exists but is not currently
+  wired into any tab or the batch runner, so this sheet is not written
+  today.
+- ``EventWindows``: one row per detected population event window
+  (event_id, start_s, end_s, ...).
+- ``EventOnsets``: long format, one row per (event_id, roi, onset_s).
+  This is the sheet most downstream analyses consume.
+- ``RoiEventTimes``: wide format, one column per ROI with every
+  detected onset time in seconds (NaN-padded). Includes onsets that
+  fall outside any population event window.
+- ``EventMonotonicity``: one row per detected event with the
+  directional-monotonicity statistics (``theta_star_deg, rho_obs,
+  p_value, u_x, u_y``) computed by
+  ``core.spatial.directional_monotonicity_spearman``.
+- ``Clusters``: one row per ROI with cluster_id, cluster_color,
+  threshold.
+
+Public surface
+--------------
+``summary_path(plane0)`` -> resolve the workbook path.
+``update_recording_meta(plane0, fps, T, N)`` -> stamp the
+``Recording`` sheet.
+``write_rois_sheet(plane0, ...)`` -> Tab 3 calls this on completion.
+``write_filter_params_sheet(plane0, ...)`` -> reserved; no caller yet.
+``write_events_sheets(plane0, event_windows, onsets_by_roi, fps)``
+    -> Tab 5; produces the EventWindows + EventOnsets + RoiEventTimes
+    triple in one call.
+``write_event_monotonicity_sheet(plane0, rows)`` -> Tab 5; one row
+    per detected event with the Spearman-rank directional
+    monotonicity scalars from
+    ``core.spatial.directional_monotonicity_spearman``.
+``write_clusters_sheet(plane0, ...)`` -> Tab 6.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import os
+import time
+from pathlib import Path
+from typing import Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+DEFAULT_FILENAME = "calliope_summary.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Path + low-level sheet I/O
+# ---------------------------------------------------------------------------
+
+
+def summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
+    """Resolve the workbook path for a given plane0 directory."""
+    return Path(plane0) / filename
+
+
+def _to_dataframe(data) -> pd.DataFrame:
+    """Coerce ``data`` to a pandas DataFrame.
+
+    Handles the idioms callers use:
+        * already a DataFrame -> return as-is.
+        * dict ``{column_name: sequence}`` -> wide DataFrame.
+        * list of dicts (one record per dict) -> long DataFrame.
+        * anything else -> defer to pandas' constructor.
+
+    Encapsulating the conversion lets every writer below stay
+    agnostic about how the caller chose to assemble its rows.
+    """
+    if isinstance(data, pd.DataFrame):
+        return data
+    if isinstance(data, dict):
+        # dict of column_name -> sequence
+        return pd.DataFrame(data)
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return pd.DataFrame(data)
+    return pd.DataFrame(data)
+
+
+def write_sheet(
+    plane0,
+    sheet_name: str,
+    data,
+    filename: str = DEFAULT_FILENAME,
+) -> Path:
+    """Replace (or create) one sheet of the workbook in place.
+
+    The interesting bit
+    -------------------
+    pandas' ``ExcelWriter`` with ``mode="a"`` + ``if_sheet_exists=
+    "replace"`` lets us write **one** sheet without trampling other
+    sheets that another tab wrote earlier. So Tab 5 writing the
+    EventWindows sheet doesn't erase the ROIs sheet that Tab 3
+    wrote.
+
+    Caller is responsible for retrying on ``PermissionError`` if
+    Excel has the file open. We surface the OS error rather than
+    swallowing it -- silent failure here would corrupt the
+    accumulated state of the workbook.
+    """
+    return write_sheets(plane0, {sheet_name: data}, filename=filename)
+
+
+def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path:
+    """Write multiple sheets in a single workbook open. ``sheets`` maps
+    sheet_name -> DataFrame/dict/records."""
+    path = summary_path(plane0, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Tab 5 writes from a background process, so two writers can overlap;
+    # each rewrites the whole file, and the loser's sheets would vanish.
+    with _workbook_lock(path):
+        exists = path.exists()
+        with pd.ExcelWriter(
+            path, engine="openpyxl", mode="a" if exists else "w",
+            **({"if_sheet_exists": "replace"} if exists else {}),
+        ) as w:
+            for name, data in sheets.items():
+                df = _to_dataframe(data)
+                if len(df) >= _XLSX_MAX_ROWS or df.shape[1] > _XLSX_MAX_COLS:
+                    # Over Excel's sheet limit (e.g. EventOnsets on a dense
+                    # in vivo recording): full table goes to a CSV beside
+                    # the workbook, the sheet just points at it.
+                    csv = path.with_name(f"{path.stem}_{name}.csv")
+                    df.to_csv(csv, index=False)
+                    df = pd.DataFrame({"note": [
+                        f"{len(df)} rows x {df.shape[1]} columns exceed Excel's "
+                        f"sheet limit; full table in {csv.name}"]})
+                df.to_excel(w, sheet_name=name, index=False)
+    return path
+
+
+# Excel's hard limits (1,048,576 rows incl. the header row; 16,384 columns).
+_XLSX_MAX_ROWS = 1_048_576
+_XLSX_MAX_COLS = 16_384
+
+
+@contextlib.contextmanager
+def _workbook_lock(path: Path, timeout_s: float = 300.0):
+    """Cross-process exclusive lock on ``<workbook>.lock`` (OS-released if
+    the holder dies, so no stale locks)."""
+    with open(str(path) + ".lock", "a+b") as fh:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} is locked by another writer")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            # flock is released when the file closes.
+
+
+# ---------------------------------------------------------------------------
+# Recording metadata sheet
+# ---------------------------------------------------------------------------
+
+
+def update_recording_meta(
+    plane0,
+    *,
+    recording_id: Optional[str] = None,
+    prefix: Optional[str] = None,
+    fps: Optional[float] = None,
+    T: Optional[int] = None,
+    N: Optional[int] = None,
+    extra: Optional[dict] = None,
+    filename: str = DEFAULT_FILENAME,
+    write: bool = True,
+) -> Path:
+    """Write/update the "Recording" sheet (key/value pairs).
+
+    Tabs 3, 5 and 6 (and their headless runners) call this on
+    completion -- the sheet acts as a single-row description of the
+    recording and a "last touched" timestamp.
+    Subsequent calls overwrite the sheet rather than append, so the
+    Recording sheet always reflects the most recent state.
+
+    All arguments after ``plane0`` are keyword-only.
+    """
+    plane0 = Path(plane0)
+    # If the caller didn't pass a recording id, infer it from the
+    # path (``/data/experiment/2025-01-15_00001/suite2p/plane0`` ->
+    # ``2025-01-15_00001``).
+    rid = recording_id or _infer_recording_id(plane0)
+    # List of (key, value) tuples becomes the two-column "Recording"
+    # sheet. Empty strings (rather than NaN) when a value wasn't
+    # supplied so the cells render cleanly in Excel.
+    rows = [
+        ("recording_id", rid),
+        ("plane0", str(plane0)),
+        ("prefix", prefix if prefix is not None else ""),
+        ("fps", float(fps) if fps is not None else ""),
+        ("T", int(T) if T is not None else ""),
+        ("N", int(N) if N is not None else ""),
+        ("generated_at",
+         datetime.datetime.now().isoformat(timespec="seconds")),
+    ]
+    if extra:
+        for k, v in extra.items():
+            rows.append((str(k), v))
+    df = pd.DataFrame(rows, columns=["key", "value"])
+    if not write:
+        return df
+    return write_sheet(plane0, "Recording", df, filename=filename)
+
+
+def _infer_recording_id(plane0: Path) -> str:
+    """Recover the human-readable recording id from a plane0 path.
+
+    A flat layout is ``<recording_id>/suite2p/plane0/...``, where two
+    ``.parent`` calls reach the recording root. The
+    ``sparse_plus_cellpose`` layout writes plane0 deeper:
+    ``<recording_id>/detection/final/suite2p/plane0/...`` -- in that
+    layout, a "two parents up" walk lands on ``final`` instead
+    of the recording id.
+
+    Defer to ``utils.infer_recording_id`` (in ``core/utils.py``) for
+    the robust resolution: it tries the canonical date-pattern regex
+    first, then falls back to the first folder above the suite2p
+    output chain (``plane0`` / ``suite2p`` / ``final`` / ``detection``
+    / ``_shared_reg`` / etc.).
+    """
+    from .utils import infer_recording_id
+    return infer_recording_id(plane0)
+
+
+# ---------------------------------------------------------------------------
+# Per-tab convenience writers
+# ---------------------------------------------------------------------------
+
+
+def write_rois_sheet(
+    plane0,
+    stat_list,
+    *,
+    p_cell: Optional[Sequence[float]] = None,
+    predicted_mask: Optional[Sequence[bool]] = None,
+    iscell: Optional[Sequence[bool]] = None,
+    filename: str = DEFAULT_FILENAME,
+) -> Path:
+    """Write a "ROIs" sheet with one row per Suite2p ROI.
+
+    ``stat_list`` is the suite2p stat.npy structure (list of dicts with
+    ``xpix``/``ypix``/``med`` keys).
+    """
+    rows = []
+    for i, s in enumerate(stat_list):
+        med = s.get("med", None) if isinstance(s, dict) else None
+        if med is None:
+            xpix = np.asarray(s["xpix"])
+            ypix = np.asarray(s["ypix"])
+            x_med = float(np.median(xpix)) if xpix.size else float("nan")
+            y_med = float(np.median(ypix)) if ypix.size else float("nan")
+        else:
+            y_med, x_med = float(med[0]), float(med[1])
+        area = int(np.asarray(s["xpix"]).size) if "xpix" in s else 0
+        rows.append({
+            "roi": i,
+            "x_med": x_med,
+            "y_med": y_med,
+            "area_px": area,
+            "p_cell": (float(p_cell[i]) if p_cell is not None
+                       and i < len(p_cell) else ""),
+            "predicted_cell": (bool(predicted_mask[i])
+                               if predicted_mask is not None
+                               and i < len(predicted_mask) else ""),
+            "iscell": (bool(iscell[i]) if iscell is not None
+                       and i < len(iscell) else ""),
+        })
+    return write_sheet(plane0, "ROIs", rows, filename=filename)
+
+
+def write_filter_params_sheet(
+    plane0,
+    params: dict,
+    filename: str = DEFAULT_FILENAME,
+) -> Path:
+    """Write the Low-pass tab parameters as a key/value sheet.
+
+    NOTE: currently unused -- no tab or batch stage calls this. Kept as
+    a ready-made writer for recording filter provenance.
+    """
+    rows = [{"key": str(k), "value": v} for k, v in params.items()]
+    return write_sheet(plane0, "FilterParams", rows, filename=filename)
+
+
+def write_events_sheets(
+    plane0,
+    event_windows,  # iterable of (start_s, end_s) or (start, end) frames
+    onsets_by_roi,  # list[np.ndarray] of onset times in seconds, len = N
+    *,
+    fps: Optional[float] = None,
+    in_seconds: bool = True,
+    filename: str = DEFAULT_FILENAME,
+    roi_ids: Optional[Sequence[int]] = None,
+    extra_sheets: Optional[dict] = None,
+    event_classes: Optional[Sequence[str]] = None,
+) -> Path:
+    """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
+
+    ``roi_ids[i]`` is the Suite2p ROI id of ``onsets_by_roi[i]`` (Tab 5's
+    ``kept_idx``). Every ``roi`` value written is that Suite2p id, so the
+    sheets line up with the ROIs / Clusters sheets and every other tab;
+    omitting it falls back to list positions.
+
+    EventWindows:  event_id, start_s, end_s, duration_s, n_active_rois
+    EventOnsets:   event_id, roi, onset_s, t_relative_s  (only onsets that
+                   fall inside an event window).
+    RoiEventTimes: wide table, one column ``roi_<i>`` per ROI listing every
+                   detected onset time in seconds (NaN-padded so all
+                   columns share the same length). Includes onsets that
+                   fall outside any event window.
+    """
+    if event_windows is None:
+        event_windows = []
+    if not in_seconds:
+        if fps is None:
+            raise ValueError(
+                "fps required when event_windows are in frame indices.")
+        event_windows = [
+            (float(s) / fps, float(e) / fps) for s, e in event_windows
+        ]
+    else:
+        event_windows = [(float(s), float(e)) for s, e in event_windows]
+
+    onsets_by_roi = [np.asarray(x, dtype=float) for x in onsets_by_roi]
+    if roi_ids is None:
+        roi_ids = range(len(onsets_by_roi))
+    roi_ids = [int(r) for r in roi_ids]
+    if len(roi_ids) != len(onsets_by_roi):
+        raise ValueError(f"roi_ids has {len(roi_ids)} entries for "
+                         f"{len(onsets_by_roi)} ROIs")
+
+    win_rows = []
+    onset_rows = []
+    for ev_id, (s, e) in enumerate(event_windows):
+        active_count = 0
+        for roi, onsets in enumerate(onsets_by_roi):
+            if onsets.size == 0:
+                continue
+            mask = (onsets >= s) & (onsets <= e)
+            if not mask.any():
+                continue
+            active_count += 1
+            for t in onsets[mask]:
+                onset_rows.append({
+                    "event_id": ev_id,
+                    "roi": roi_ids[roi],
+                    "onset_s": float(t),
+                    "t_relative_s": float(t) - s,
+                })
+        win_rows.append({
+            "event_id": ev_id,
+            "start_s": s,
+            "end_s": e,
+            "duration_s": e - s,
+            "n_active_rois": active_count,
+            **({"class": event_classes[ev_id]} if event_classes is not None
+               and ev_id < len(event_classes) else {}),
+        })
+
+    # Wide per-ROI sheet: every onset for every ROI, NaN-padded to a
+    # common length so the columns line up. Useful for downstream scripts
+    # that want all events per ROI without filtering by population window.
+    max_len = max((arr.size for arr in onsets_by_roi), default=0)
+    roi_event_times: dict[str, np.ndarray] = {}
+    for roi, arr in enumerate(onsets_by_roi):
+        padded = np.full(max_len, np.nan, dtype=float)
+        if arr.size:
+            padded[:arr.size] = arr
+        roi_event_times[f"roi_{roi_ids[roi]}"] = padded
+    roi_event_times_df = pd.DataFrame(roi_event_times)
+
+    return write_sheets(
+        plane0,
+        {
+            "EventWindows": win_rows,
+            "EventOnsets": onset_rows,
+            "RoiEventTimes": roi_event_times_df,
+            **(extra_sheets or {}),
+        },
+        filename=filename,
+    )
+
+
+def write_event_monotonicity_sheet(
+    plane0,
+    monotonicity_rows: Sequence[dict],
+    *,
+    filename: str = DEFAULT_FILENAME,
+    write: bool = True,
+) -> Path:
+    """Write the "EventMonotonicity" sheet.
+
+    Schema: ``event_id, n_active, theta_star_deg, rho_obs, p_value,
+    p_value_fdr, n_shuffles, u_x, u_y``. One row per detected population
+    event.
+
+    ``theta_star`` is the projection direction (in degrees, CCW from
+    +x) maximising the Spearman rank correlation between
+    ``s_i = x_i cos θ + y_i sin θ`` and the per-ROI activation time;
+    ``rho_obs`` is that maximum; ``p_value`` is the empirical
+    permutation-test p (corrects for the multiple-θ search via
+    max-over-θ on each shuffle). ``p_value_fdr`` is the
+    Benjamini-Hochberg FDR-adjusted q-value across the per-event tests
+    in this recording (compare against your target FDR, typically 0.05).
+    ``u_x = cos θ_star`` / ``u_y = sin θ_star`` are written redundantly
+    so downstream scripts can read the propagation axis as a unit vector
+    without converting degrees back.
+
+    Events for which the test is undefined (fewer than 3 active ROIs,
+    no spread in activation time or in x/y) get blank value cells
+    rather than NaN so the workbook reads cleanly in Excel.
+    """
+    rows = []
+    for r in monotonicity_rows:
+        rows.append({
+            "event_id": int(r["event_id"]),
+            "n_active": int(r["n_active"]),
+            "theta_star_deg": (float(r["theta_star_deg"])
+                               if r.get("theta_star_deg") is not None
+                               else ""),
+            "rho_obs": (float(r["rho_obs"])
+                        if r.get("rho_obs") is not None else ""),
+            "p_value": (float(r["p_value"])
+                        if r.get("p_value") is not None else ""),
+            "p_value_fdr": (float(r["p_value_fdr"])
+                            if r.get("p_value_fdr") is not None else ""),
+            "n_shuffles": (int(r["n_shuffles"])
+                           if r.get("n_shuffles") is not None else ""),
+            "u_x": (float(r["u_x"]) if r.get("u_x") is not None else ""),
+            "u_y": (float(r["u_y"]) if r.get("u_y") is not None else ""),
+        })
+    if not write:
+        return rows
+    return write_sheet(plane0, "EventMonotonicity", rows, filename=filename)
+
+
+def write_clusters_sheet(
+    plane0,
+    cluster_labels,  # length N, fcluster() ints
+    *,
+    cluster_colors: Optional[dict] = None,  # cluster_id -> hex
+    threshold: Optional[float] = None,
+    method: str = "average",
+    metric: str = "correlation",
+    roi_indices: Optional[Sequence[int]] = None,
+    filename: str = DEFAULT_FILENAME,
+) -> Path:
+    """Write a "Clusters" sheet.
+
+    Schema: roi, cluster_id, cluster_color, threshold_used, method, metric
+
+    ``roi_indices`` (optional, len N) is written into the ``roi`` column.
+    Pass the Suite2p ROI indices when the cluster_labels were computed on
+    a filter-restricted view of dF/F so the column lines up with the
+    ``roi`` column in the ROIs sheet. If omitted, the column falls back
+    to ``0..N-1``.
+    """
+    cluster_labels = np.asarray(cluster_labels)
+    if roi_indices is None:
+        roi_indices = range(len(cluster_labels))
+    elif len(roi_indices) != len(cluster_labels):
+        raise ValueError(
+            f"roi_indices length {len(roi_indices)} does not match "
+            f"cluster_labels length {len(cluster_labels)}.")
+    rows = []
+    for roi, lbl in zip(roi_indices, cluster_labels):
+        rows.append({
+            "roi": int(roi),
+            "cluster_id": int(lbl),
+            "cluster_color": (cluster_colors.get(int(lbl), "")
+                              if cluster_colors else ""),
+            "threshold_used": (float(threshold) if threshold is not None
+                               else ""),
+            "method": method,
+            "metric": metric,
+        })
+    return write_sheet(plane0, "Clusters", rows, filename=filename)

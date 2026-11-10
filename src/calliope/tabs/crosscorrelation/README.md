@@ -1,0 +1,355 @@
+# Tab 7 — Cross-Correlation
+
+**Goal.** For each pair of clusters (Cᵢ × Cⱼ) and each pair of cells inside them, compute the time-lagged Pearson correlation. Report:
+- `best_lag_sec` — lag at which correlation peaks (positive = ROI A leads).
+- `max_corr` — Pearson r at that lag.
+- `zero_lag_corr` — Pearson r at lag 0.
+
+Two modes: **full recording** and **per event** (cropped to each window from Tab 5). Plus a **violin plot** summarising every pair's distribution and a **single-pair preview** for inspecting individual cell pairs. The preview's ROI A / ROI B boxes take **Suite2p ROI ids** (as shown everywhere else); an id the cell filter rejected is refused with a message.
+
+---
+
+## 1. Inputs
+
+From `plane0/`:
+- `r0p7_filtered_dff.memmap.float32` — `(T, N_kept)` filtered dF/F.
+- `r0p7_cell_mask_bool.npy` — the keep mask frozen when Tab 3 wrote the filtered memmap; used (via `utils.resolve_filtered_mask`, anchored to the memmap's file size) to translate Suite2p ROI ids to dF/F columns. `predicted_cell_mask.npy` / `iscell.npy` are only fallbacks when the frozen mask is missing, so curation after Filtered dF/F can't shift the columns xcorr reads.
+- `<plane0>/r0p7_filtered_cluster_results/C*_rois.npy` — cluster files from Tab 6 (Suite2p ROI indices, with the `_indices_are_suite2p` marker).
+- Event windows for per-event mode: live from Tab 5 via `AppState.event_results` (subscribed at `__init__`), with the `EventWindows` sheet of `<rec>_summary.xlsx` as a cold-start fallback when no Tab 5 publish exists yet.
+
+---
+
+## 2. Pipeline steps
+
+> **Headless entry point.** The xcorr math (`run_cluster_xcorr_full_fast`
+> and `run_cluster_xcorr_per_event_fast` in `core/crosscorrelation.py`)
+> is callable without Tk. `core/crosscorrelation.py` also provides a
+> thin batch-friendly wrapper (`run_crosscorrelation(plane0, params, *,
+> event_windows=None, figures_dir=None, progress_cb=None)`) that drives
+> both the full-recording and per-event runs and saves `full.png` /
+> `per_event.png` violin plots (same layout the GUI shows in Tab 7).
+> `per_event.png` shows one **representative** event window (the one with
+> the most cluster-pair data); per-window CSVs for every event are written
+> under the cluster-results tree.
+> Tab 7's own figure export (also what the GUI Tab 0 batch calls) picks
+> the same representative event.
+> Tab 0's headless batch path uses this; Tab 7 runs the same runners in
+> a child process (`run_cluster_xcorr_offload` via `core.offload`) and
+> adds its interactive filters. The GUI batch drives Tab 7 through
+> `apply_batch_row`, which honours a row's `max_lag_seconds`, `zero_lag`,
+> `use_gpu`, `n_shuffles` and `compute_partial`. All five are batch
+> columns (group `6. Cross-correlation`), so a blank cell means the batch
+> default; a direct `apply_batch_row` call without a key leaves that
+> widget as it is. Bool values accept strings such as `"false"`. `run_crosscorrelation` also reads an optional
+> `shuffle_seed` (default 0).
+
+### Step 1 — Open dF/F and the cluster files
+
+`_open_dff_memmap(plane0, prefix)`:
+
+1. `F.npy` shape gives `N_total, T`.
+2. If `prefix` contains `filtered`, resolve the keep mask with `utils.resolve_filtered_mask` (frozen `r0p7_cell_mask_bool.npy` first, cross-checked against the memmap's file size), set `N_kept = mask.sum()`, return `(memmap, T, N_kept)`.
+3. Otherwise the memmap is `(T, N_total)`.
+
+`_load_clusters_from_dir(cluster_dir, keep_mask)`:
+
+- If `_indices_are_suite2p` marker exists: read each `C*_rois.npy` as-is (Suite2p ROI indices).
+- Otherwise (legacy layout): translate filtered-list positions to Suite2p indices via `np.where(keep_mask)[0]`.
+- `manual_combined*` files are ignored.
+
+`_load_keep_mask(plane0, prefix)` returns that same file-size-anchored mask (never the live `predicted_cell_mask.npy`), and `_cluster_columns` maps each cluster's Suite2p ids to memmap columns. ROIs outside the mask are dropped with a log line; an id or column outside the memmap raises a `ValueError` asking you to re-run clustering, instead of silently slicing the wrong traces. No current Tab 6 writer produces the legacy layout; the branch stays so older cluster folders still load.
+
+### Step 2 — Batched cross-correlation (`batch_xcorr_clusters`)
+
+The core algorithm. Given two cluster matrices `X_A: (T, nA)` and `X_B: (T, nB)`, compute the (nA, nB) `best_lag_sec`, `max_corr`, `zero_lag_corr` matrices in **one matmul per lag**.
+
+```python
+ZA = zscore_cols(X_A)          # (T, nA)
+ZB = zscore_cols(X_B)          # (T, nB)
+L  = floor(max_lag_seconds * fps)
+
+pad    = zeros((L, nA))
+ZA_pad = concat([pad, ZA, pad])         # (T+2L, nA)
+
+best_corr     = full((nA, nB), -inf)
+best_lag_idx  = zeros((nA, nB), int32)
+zero_lag_corr = None
+
+for j in range(2L + 1):
+    Zs = ZA_pad[j : j + T]              # sliding view, no copy
+    C  = (Zs.T @ ZB) / T                # (nA, nB) Pearson r at lag (j - L)
+    if (j - L) == 0:
+        zero_lag_corr = C.copy()
+    mask         = C > best_corr
+    best_corr    = where(mask, C, best_corr)
+    best_lag_idx = where(mask, j, best_lag_idx)
+
+best_lag_sec = (best_lag_idx - L) / fps
+```
+
+Why this is fast: a naïve "for each pair, slide one signal past the other" is O(nA · nB · 2L · T) Python-loop work. The batched form replaces it with `(2L+1)` `(nA × T) · (T × nB)` matmuls, which the BLAS / cuBLAS GEMM kernel handles efficiently. For two 200-cell clusters at 9000 frames and `L = 30` (2 s at 15 fps) that's `61` GEMMs of size `200 × 9000 · 9000 × 200` — milliseconds.
+
+#### `_zscore_cols_xp(X, xp, eps=1e-12)`
+
+```python
+mu      = X.mean(axis=0, keepdims=True)
+sd      = X.std(axis=0, keepdims=True)
+sd_safe = where(sd == 0, 1, sd)
+Z       = (X − mu) / sd_safe
+Z[:, sd==0] = 0                          # zero-out constant columns
+```
+
+This produces the **biased Pearson r**: `(Z_a · Z_b) / T`, not the unbiased `cov / (sd_a · sd_b)`. The two differ by a `T/(T-1)` factor that is constant across pairs, so it makes no difference for argmax.
+
+#### GPU path
+
+When `use_gpu=True` and `cupy` is importable:
+
+```python
+xp = cupy
+XA = xp.asarray(X_A); XB = xp.asarray(X_B)
+# ... same algorithm with xp instead of np ...
+return cp.asnumpy(...)
+```
+
+A single `cp.asarray` move at the top, all matmuls on GPU, one `cp.asnumpy` at the end. No CPU↔GPU pingpong inside the loop.
+
+### Step 3 — Full-recording mode (`run_cluster_xcorr_full_fast`)
+
+```python
+cluster_names = _xcorr_cluster_names(clusters)   # sorted; drops clusters with < MIN_XCORR_CLUSTER_SIZE (2) ROIs, logging them
+for iA, cA in enumerate(cluster_names):
+    for cB in cluster_names[iA:]:         # upper triangle only (incl. CnxCn blocks)
+        X_A = dff[:, clusters[cA]]
+        X_B = dff[:, clusters[cB]]
+        best_lag, best_corr, zero_corr = batch_xcorr_clusters(
+            X_A, X_B, fps, max_lag_seconds, use_gpu=use_gpu)
+        write_pair_summary_csv(out_root / f"{cA}x{cB}", ...)
+        progress_cb(...)
+```
+
+Only the upper triangle (`cluster_names[iA:]`) is written, so a pair appears
+once as `CAxCB` (never the mirror `CBxCA`); within-cluster blocks `CAxCA` are included
+but hold only the distinct `i < j` ROI pairs (`same_cluster=True`): no self-pairs
+(r = 1, lag 0) and no mirrored duplicates. Clusters with fewer than
+`MIN_XCORR_CLUSTER_SIZE = 2` ROIs are skipped entirely (a 1-ROI cluster has no
+within-cluster pairs and its cross-cluster pairs all reuse one cell) and the skip is
+logged as `[xcorr] skipping cluster(s) with < 2 ROIs: ...`. For `CAxCA` the
+`p_value_fdr` Benjamini-Hochberg correction runs over the `i < j` p-values only
+(self-pairs and mirrored entries are not tests).
+
+The output layout is:
+
+```
+<plane0>/r0p7_filtered_cluster_results/cross_correlation_full/
+├── C1xC1/
+│   └── C1xC1_summary.csv          ← per-pair best_lag_sec, max_corr, zero_lag_corr
+├── C1xC2/
+├── ...
+```
+
+The summary CSV has columns:
+
+```
+roiA, roiB, best_lag_sec, max_corr, zero_lag_corr [, p_value, p_value_fdr, partial_corr_zero_lag]
+```
+
+`roiA` and `roiB` are **Suite2p ROI indices**. When the "shuffles" GUI field is > 0 (default 500), the per-pair circular-shift null adds two more columns:
+
+- `p_value` — fraction of circular-shift draws (jittered alignment, preserving each ROI's autocorrelation) whose max-correlation ≥ the observed max, with the Phipson-Smyth +1/+1 correction so a pair that beats every shuffle still gets a non-zero p capped at `1/(n_shuffles+1)`.
+- `p_value_fdr` — Benjamini-Hochberg-adjusted q-value across the (nA × nB) matrix. Compare against your target FDR (typically 0.05) to flag significant pairs.
+
+The circular-shift null is the field-standard fix for the autocorrelation-inflated false-positive rate that parametric tests (Marčenko-Pastur) suffer on calcium imaging data — see Cheng et al. eLife 2023 ([doi:10.7554/eLife.81279](https://doi.org/10.7554/eLife.81279)). The per-event runner does not compute per-window shuffles and takes no `n_shuffles` / `shuffle_seed` arguments; the Tab 7 GUI strips the field before calling it and logs a note. The full-recording null is seeded deterministically (cluster pair *k* uses `shuffle_seed + k`, `shuffle_seed` default 0), so re-running gives identical p-values.
+
+When the "+ partial corr" checkbox is on (default off), an additional column appears:
+
+- `partial_corr_zero_lag` — partial correlation between `roiA` and `roiB` conditioning on every other ROI in the union of all clusters. Computed once via `core/crosscorrelation.py::compute_partial_correlation` on the full population's z-scored dF/F (ridge `1e-6`), then sliced per cluster pair. The motivating use case: disambiguate "A and B drive each other" from "A and B are both driven by some other ROI C" — Pearson can't tell those apart but partial correlation can (Sutera et al. [arXiv:1406.7865](https://arxiv.org/abs/1406.7865); Stevenson [arXiv:1708.01888](https://arxiv.org/abs/1708.01888)). Requires `N_union < 0.5 * T` (precision-matrix conditioning); the run automatically skips and warns above that threshold. Entries are `nan` when a cluster ROI isn't in the keep mask.
+
+With partial correlation on, each cluster pair also gets a side-by-side heatmap PNG, `CAxCB_corr_heatmaps.png` (left: zero-lag Pearson r; right: partial correlation), written next to that pair's summary CSV. The `zero_lag_corr` column is always written into the summary CSV whenever partial correlation is on, so both matrices in the figure can be reconstructed from the CSV alone.
+
+> **Indicator-kinetics caveat.** Pearson r on filtered dF/F is biased by GCaMP rise + decay: every spike is convolved with a ~tens-to-hundreds-of-ms exponential, so the visible CCG peak is blurred by the indicator's autocorrelation. The apparent lag resolution is **indicator-limited, not frame-rate-limited**, and correlation magnitudes are inflated relative to spike-time correlations (Yatsenko/Mishne, eLife 2021, [doi:10.7554/eLife.68046](https://doi.org/10.7554/eLife.68046)). To get an indicator-independent CCG, compute on deconvolved/binned spike rates (Berens et al. 2018, 40 ms bins). The input is always `r0p7_filtered_dff.memmap.float32` (there is no input-signal selector).
+
+### Step 4 — Per-event mode (`run_cluster_xcorr_per_event_fast`)
+
+For each `(start_s, end_s)` window (from Tab 5's in-memory publish if available, else from the EventWindows xlsx sheet):
+
+```python
+f0, f1 = round(start_s * fps), round(end_s * fps)
+X_A    = dff[f0:f1, A_rois]
+X_B    = dff[f0:f1, B_rois]
+# clamp max_lag to (f1 - f0 - 1) / fps so it's never wider than the window
+batch_xcorr_clusters(X_A, X_B, ...)
+```
+
+Output layout writes one directory per event, directly under
+`cross_correlation_per_event/`, named `event{NNNN}_{start}s_{end}s` with dots
+replaced by `p`:
+
+```
+.../cross_correlation_per_event/
+├── event0000_0p0s_0p8s/
+│   ├── C1xC2/...
+├── event0007_12p3s_13p1s/
+├── ...
+```
+
+`max_lag` is automatically capped to the available window length so a 0.4 s event with default `max_lag = 2 s` won't crash — it gets clamped down.
+
+The per-event run returns one CSV per (event, cluster pair) and is what gets aggregated for "during seizures, who led whom?" analyses.
+
+### Step 5 — Single-pair preview
+
+`single_pair_xcorr_curve(sigA, sigB, fps, max_lag_seconds)` computes the **full curve** (not just the peak) for one pair:
+
+```python
+T = sigA.size
+Za = zscore(sigA); Zb = zscore(sigB)
+L  = floor(max_lag_seconds * fps)
+pad      = zeros(L)
+Za_pad   = concat([pad, Za, pad])
+windows  = sliding_window_view(Za_pad, T)        # (2L+1, T)
+r        = (windows @ Zb) / T
+lags_sec = arange(-L, L+1) / fps
+return lags_sec, r
+```
+
+Plotted with the peak marked in red and the zero-lag value marked in green. The user can crop to a specific event from a dropdown (rebuilt from the EventWindows on tab refresh).
+
+### Step 6 — Violin plots
+
+`ViolinWindow` reads every `*_summary.csv` in `cross_correlation_full/` (or `cross_correlation_per_event/`) and renders two violins per cluster pair:
+
+1. **Top panel — zero-lag correlation** distribution (`zero_lag_corr` column): one violin per pair, ordered by natural pair key (`C1xC2`, `C1xC10` correctly ordered).
+2. **Bottom panel — best-lag distribution** (`best_lag_sec` column), coloured by sign and significance:
+   - **Blue** (`#6FA8FF`) — mean lag > 0 and significant: ROI A consistently *leads* ROI B.
+   - **Red** (`#E87B73`) — mean lag < 0 and significant: ROI A consistently *lags* ROI B.
+   - **Gray** (`#CFCFCF`) — not significant.
+
+#### Sign-flip permutation test (`_sign_flip_pvalue`)
+
+The test is **ROI-level** (`_roi_level_lag_pvalue`): for a cross-cluster pair `CAxCB`, `values` holds one number per ROI of A, namely that ROI's mean `best_lag_sec` over B's ROIs (`groupby("roiA")`). Pairs reuse the same cells, so testing every pair directly would be pseudo-replication. Fewer than 2 ROIs gives NaN. Within-cluster blocks (`CnxCn`) get **no test** (NaN): each `i < j` pair's lag sign is arbitrary, so there is no lead/lag direction. The violin titles state the mode, "full recording" or "per-event windows". For the `values` array of length `n`:
+
+```python
+observed = abs(values.mean())
+hits = 0
+for _ in range(n_perm):                              # default 10000
+    signs    = random_choice([-1, +1], size=n)
+    permuted = (signs * values).mean()
+    if abs(permuted) >= observed:
+        hits += 1
+p = hits / n_perm
+```
+
+Implemented in **chunks of 256 permutations** to keep memory at `O(chunk · n)` instead of `O(n_perm · n)` — important for large clusters (200 × 200 ROI pairs would OOM with the naïve allocation).
+
+This tests `H0: lag distribution is symmetric around 0` (no consistent lead/lag direction). Rejecting `H0` means the cluster pair has a directional relationship.
+
+**Multiple-comparison correction.** The colours and markers use **Benjamini–Hochberg FDR-corrected** p-values (`_lag_pvalues_fdr`, reusing `core.crosscorrelation._bh_fdr`). The family is every tested between-cluster pair of the run. Untested within-cluster pairs (NaN) are left out. Hiding clusters in the viewer does not change the family, so a violin's significance never depends on which other clusters are shown. These p-values are not written to any CSV. The per-cell-pair `p_value` / `p_value_fdr` columns in the summary CSVs are a different test (the circular-shift null).
+
+Significance markers (on the FDR-corrected p): `***` (`p < 0.001`), `**` (`p < 0.01`), `*` (`p < 0.05`).
+
+### Step 7 — Aborting
+
+A long full-recording run on a large cluster set can take minutes. The run executes in a child process (`core.offload`); the Abort button sets `self._abort_evt` (a spawn `Event` from `core.offload.make_abort_event`). The child's progress callback checks it between batches and raises `XcorrAborted`, which `run_cluster_xcorr_offload` catches and turns into its normal `done` payload with `aborted=True`. `_on_xc_done` routes that payload to `_on_xc_aborted`, so you see a status message instead of an error dialog.
+
+---
+
+## 3. Outputs (on disk)
+
+```
+<plane0>/r0p7_filtered_cluster_results/
+├── cross_correlation_full/
+│   ├── C{i}xC{j}/
+│   │   ├── C{i}xC{j}_summary.csv
+│   │   └── C{i}xC{j}_corr_heatmaps.png   ← only with "+ partial corr": zero-lag Pearson | partial corr
+│   └── ...
+├── cross_correlation_per_event/
+│   └── event{NNNN}_{start}s_{end}s/
+│       └── C{i}xC{j}/
+│           └── C{i}xC{j}_summary.csv
+```
+
+The violin PNG/SVG is rendered separately into the `calliope_figures`
+tree (`full.png` / `per_event.png`), not into the cluster-results tree above.
+
+(See `core/crosscorrelation.py: _write_pair_summary_csv` and the two `run_*_fast` functions for the exact layout.)
+
+---
+
+## 4. Advanced settings
+
+Tab 7 has **no `PARAM_SPEC` and no Advanced dialog** — every tunable knob is an
+inline Tk-var widget in the header (`CrossCorrelationTab._build_ui`) plus the
+single-pair preview controls (same method, right pane). The run params dict is
+assembled by `CrossCorrelationTab._gather_params` and passed straight to
+`core/crosscorrelation.py::run_cluster_xcorr_full_fast` /
+`run_cluster_xcorr_per_event_fast`. Defaults below are exactly the widget
+`value=` literals; do not assume an Advanced popout exists.
+
+### Inputs (header rows 1–2)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `prefix` | `r0p7_filtered_` (`DEFAULT_PREFIX`) | Filename prefix of the dF/F memmap and cluster-results tree to open (`_open_dff_memmap`). When the prefix contains `filtered`, the loader also applies the keep mask so `N_kept = mask.sum()`. | Must match what Tab 6 actually exported. Change it only if you reclustered an unfiltered or differently-prefixed export; a wrong prefix means "file not found" or a shape mismatch, not a silent fallback. |
+| `cluster_folder` | `""` (`DEFAULT_CLUSTER_FOLDER`) | Subfolder under `<plane0>/r0p7_filtered_cluster_results/` holding the `C*_rois.npy` cluster files. Empty string ⇒ read straight from the cluster-results root. Blank input falls back to this default (`_gather_params`). | Tab 6 writes straight into the cluster-results root, so leave it blank; set it only if you moved cluster files into a named subdirectory yourself. If you point it at the wrong folder you'll cross-correlate the wrong (or zero) clusters. |
+| `fps` | `15.08` (`utils.DEFAULT_FPS`) | Frame rate used to convert lag indices to seconds and `max_lag` seconds to a frame radius `L = floor(max_lag·fps)` (in `batch_xcorr_clusters` and both `run_*_fast` runners). On plane0 load it is auto-filled via `utils.get_fps_from_notes(plane0, default_fps=DEFAULT_FPS)`, which returns the detection rate saved in `plane0/ops.npy['fs']` (includes Tab 3's FPS override) and falls back to the default only if that is missing (`_set_plane0`); a non-numeric entry silently reverts to the last good value (`_gather_params`). | Get this right — every reported `best_lag_sec` scales linearly with `fps`. Too high and lags read short; too low and they read long. The 15.08 fallback is only a default, not a universal value; override it to match your acquisition. |
+
+### Search parameters (header row 3)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `max_lag_seconds` | `2.0` (`DEFAULT_MAX_LAG_S`) | Half-width of the lag search window in seconds. Sets `L = floor(max_lag·fps)`; the loop runs `2L+1` lag-matmuls, so `best_lag_sec ∈ [−max_lag, +max_lag]`. In per-event mode it is auto-clamped to `win_len − 1/fps` so a short event is never mostly zero padding (`run_cluster_xcorr_per_event_fast`). Bad input reverts to `2.0` (`_gather_params`). | Raise it if you expect long lead/lag delays between clusters (slow propagation); a peak pinned at the edge means the window is too narrow. Lower it for tight, fast coupling — cost and zero-padding both grow with `L`, and a too-wide window invites spurious far-lag peaks. |
+| `zero_lag` ("also output zero-lag corr") | `True` (`zero_lag_var`) | Captures the lag-0 Pearson matrix during the per-lag sweep of `batch_xcorr_clusters` and adds a `zero_lag_corr` column to every summary CSV (`run_cluster_xcorr_full_fast`). Forced on whenever `compute_partial` is set, since the heatmap needs it. | Leave on — it's nearly free (the lag-0 matmul happens anyway) and zero-lag r is what the violin top panel and the partial-corr heatmap read. Turn it off only to drop the extra CSV column when you care solely about the best-lag peak. (Output is CSV-only; no dense `.npy` matrices are written.) |
+| `use_gpu` ("use GPU if available") | `True` (`gpu_var`) | Runs the z-scoring + lag matmuls on CuPy when importable: one `cp.asarray` in, all GEMMs on-device, one `cp.asnumpy` out — no per-lag host↔device copies. Silently falls back to NumPy if CuPy is absent. | Keep on; on large cluster sets the GEMM sweep is the whole cost and the GPU speeds it up substantially. Turn it off only to debug a CuPy/driver issue or to free the GPU for another process — results are numerically identical, just slower. |
+| `n_shuffles` ("shuffles (0=off)") | `500` (`n_shuffles_var`) | Number of circular-shift null draws per ROI pair (see `run_cluster_xcorr_full_fast`). Each draw jitters one signal's alignment (preserving its autocorrelation) and recomputes the max correlation; `p_value = (hits+1)/(n_shuffles+1)` (Phipson–Smyth +1/+1), then a Benjamini–Hochberg `p_value_fdr` across the matrix. Adds both columns to the CSV. `0` disables the test. The widget reads `max(0, int(...))`, so a negative integer clamps to `0` (test disabled); only non-integer input falls back to `500` (`_gather_params`). | This is the field-standard fix for autocorrelation-inflated false positives on calcium data (Cheng et al., eLife 2023). The smallest p you can report is `1/(n_shuffles+1)`, so 500 ⇒ p ≥ 0.002 — raise it (e.g. 1000–5000) for finer resolution at strictly linear time cost; set 0 for a fast exploratory pass with no significance. Per-event runs ignore it (the GUI strips the flag and logs a note). |
+| `compute_partial` ("+ partial corr (requires N < T/2)") | `False`/unchecked (`partial_corr_var`) | Computes the population-wide partial-correlation matrix once over the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`, ridge `1e-6`), conditioning each pair on every other ROI, then slices it per cluster pair. Adds `partial_corr_zero_lag` to each pair's CSV, forces the `zero_lag_corr` column on, and writes a side-by-side `CAxCB_corr_heatmaps.png` (zero-lag Pearson \| partial). Auto-skipped with a warning when `N_union ≥ 0.5·T` (precision matrix ill-conditioned). | Turn it on to tell "A and B drive each other" apart from "A and B are both driven by some third ROI C" — plain Pearson can't, partial correlation can. Costs one extra precision-matrix solve plus a heatmap per pair. Only meaningful on the full-recording run (Tab 7 strips it on per-event and logs a notice); entries are `nan` for ROIs outside the keep mask. |
+
+### Single-pair preview (right pane)
+
+These four inline controls only drive the interactive curve plot — they do not
+touch the batch CSV outputs.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `sp_roiA` / `sp_roiB` ("ROI A" / "ROI B") | `0` / `1` (`sp_roiA_var` / `sp_roiB_var`) | The two **Suite2p ROI indices** fed to `single_pair_xcorr_curve`, which returns the full `(2L+1)` lag curve for that one pair (not just the peak). | Use the same Suite2p numbers you see in the summary CSVs to eyeball any specific pair's CCG shape, peak lag, and zero-lag value before trusting the aggregate violins. |
+| `sp_lag` ("lag window (s)") | `2.0` (`DEFAULT_MAX_LAG_S`, `sp_lag_var`) | Independent `max_lag_seconds` for the preview curve only. | Widen it to confirm a peak isn't being clipped, or narrow it to zoom the central lobe. Does not affect any batch run. |
+| `sp_event` ("event") | `full recording` (`sp_event_var`) | Crops the preview to a single event window (rebuilt from EventWindows on refresh) or the whole trace. | Switch to a specific event to inspect lead/lag during one seizure rather than the whole recording. |
+
+For the violin permutation test (not user-exposed; fixed in code): `n_perm=10000`,
+`chunk=256`, `seed=0`.
+
+---
+
+## 5. UI flow
+
+1. Set plane0 (auto-broadcast from Tab 5 or browse). Tab 7 also refreshes when Tab 6 exports (`clusters_ready`), so Run enables without a manual reload.
+2. Set prefix / cluster_folder / fps / max_lag.
+3. **Run full-recording cross-correlation** — runs until done (or abort).
+4. **Reload event windows** if you've edited the xlsx by hand (Tab 5 reruns auto-push via `event_results`).
+5. **Run per-event cross-correlation** — only enabled when events exist.
+6. **Violin plot** — opens a separate window over the `cross_correlation_full/` outputs.
+7. **Single-pair preview** — pick two ROI indices (Suite2p numbers), choose full or specific event, click Plot.
+
+---
+
+## 6. Re-implementation checklist
+
+1. **Z-score columns + biased Pearson r:** `(Z_A · Z_B) / T` after zero-mean-unit-std per column (with constant-column protection).
+2. **Batched lag search:** pad ZA on both ends with `L` zeros, slide a `(T, nA)` view across the padded array, do one `(nA, nB)` GEMM per lag, track running per-pair argmax.
+3. **GPU path** identical to (2) but with `cupy` arrays; a single `asarray` in and `asnumpy` out.
+4. **Cluster file format:** `C{i}_rois.npy` containing Suite2p ROI indices, plus a `_indices_are_suite2p` marker file. Honour both layouts on load.
+5. **Per-event windowing:** prefer Tab 5's in-memory `event_results` for the current plane0; fall back to the EventWindows sheet of `<rec>_summary.xlsx`. Convert seconds to `(f0, f1)` frame indices and clamp `max_lag` to the window length so zero-pad doesn't dominate.
+6. **Sign-flip permutation:** on per-roiA mean best lags (not per pair), skipping within-cluster blocks; random ±1 signs over the values array, recompute mean, count `|permuted| ≥ |observed|`. Chunk the random-sign matrix to bound memory.
+7. **Single-pair full curve:** same z-scoring, but use `numpy.lib.stride_tricks.sliding_window_view` and one `(2L+1, T) · (T,)` matmul to get all lags in one shot.
+8. **Output schema:** one per-pair `C{i}xC{j}_summary.csv` (via `np.savetxt`) holding `roiA, roiB, best_lag_sec, max_corr [, zero_lag_corr, …]` so downstream analyses can read the summaries. No dense `.npy` matrices are written.
+
+
+## UI affordances
+
+Tab 7 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Horizontal sash** splits the run log (left) from the single-pair cross-correlation preview (right). Drag the sash to redistribute.
+- **Log console** is hover-scrollable: spin the wheel anywhere over the log to scroll it.
+- **Popouts.**
+  - **Violin plot** (`ViolinWindow`) — opens from the "Violin plot" button after a full-recording run completes; resizable Toplevel showing zero-lag and best-lag violin distributions per cluster pair. Cascade menu lets the user mask out specific clusters.
+- Matplotlib navigation toolbars in both the main panel and the single-pair preview are dark-skinned via `restyle_matplotlib_toolbar`.

@@ -1,0 +1,251 @@
+"""Run the trained cell-filter CNN over a recording.
+
+Why this script exists
+----------------------
+Tab 3's detection step produces a ``stat.npy`` with N candidate
+ROIs. Many of those candidates are noise / blood vessels / motion
+artefacts. ``train.py`` produces a model checkpoint that scores any
+ROI as "real cell" vs "not"; this file is the runtime that loads the
+checkpoint and applies it to every ROI in a recording, then writes:
+
+    suite2p/plane0/predicted_cell_prob.npy   float32 (N,)
+        Sigmoid-of-logit probabilities, one per ROI.
+    suite2p/plane0/predicted_cell_mask.npy   bool (N,)
+        ``probs >= THRESHOLD`` minus large-area outliers
+        (``size_outlier_mask``) -- the actual keep mask Tabs 4-8 use.
+
+The GUI calls ``predict_recording`` after Tab 3's detection finishes;
+the CLI in ``main()`` is for batch-running over many recordings on a
+GPU box.
+
+Usage
+-----
+    python -m calliope.core.cellfilter.predict --plane0 PATH [PATH ...]
+            [--ckpt PATH] [--size-outlier-z Z]
+        --- predicts for the listed plane0 directories. Multiple
+            paths are batched in one Python process so the model
+            checkpoint is loaded only once. ``--size-outlier-z 0``
+            turns the post-CNN size gate off, matching Tab 3's
+            ``size_outlier_z`` setting.
+
+Accepts full traces at inference (no random crop).
+"""
+from __future__ import annotations
+
+# Set process-level environment variables BEFORE numpy / torch
+# import to avoid a known Intel MKL multi-threading conflict on
+# Windows. ``setdefault`` only sets the variable if the user hasn't
+# already configured it.
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+# ``argparse`` is the stdlib command-line parser. Roughly the
+# equivalent of R's ``optparse::OptionParser``.
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from . import config as C
+from .dataset import _RecordingCache
+from .model import CellFilter
+
+
+def size_outlier_mask(stat, keep, z_thresh: float) -> np.ndarray:
+    """True where a KEPT ROI is a large-area outlier: robust z of
+    log(npix) over the kept ROIs > ``z_thresh`` (one-sided -- only
+    too-big ROIs). All-False when disabled (``z_thresh <= 0``), with
+    < 10 kept ROIs, or when the kept sizes have zero spread.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    out = np.zeros_like(keep)
+    if not z_thresh or z_thresh <= 0 or keep.sum() < 10:
+        return out
+    k = np.log(np.array([s["npix"] for s in stat], dtype=float))[keep]
+    med = np.median(k)
+    mad = 1.4826 * np.median(np.abs(k - med))
+    if mad == 0:
+        return out
+    out[keep] = (k - med) / mad > z_thresh
+    return out
+
+
+def keep_mask_from_scores(probs, stat, *, threshold: float = C.THRESHOLD,
+                          iscell=None,
+                          size_outlier_z: float = C.SIZE_OUTLIER_Z):
+    """Keep rule: ``probs >= threshold``, or Suite2p's own classifier when
+    ``iscell`` (the ``iscell.npy`` array) is given; the size-outlier gate
+    applies either way. Returns ``(mask, size_outliers)``."""
+    mask = (np.asarray(iscell)[:, 0] > 0 if iscell is not None
+            else np.asarray(probs) >= float(threshold))
+    big = size_outlier_mask(stat, mask, size_outlier_z)
+    return mask & ~big, big
+
+
+@torch.no_grad()                                                  # See model.py
+def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
+                      plane0: Path | None = None,
+                      size_outlier_z: float = C.SIZE_OUTLIER_Z,
+                      threshold: float = C.THRESHOLD,
+                      use_iscell: bool = False) -> Path:
+    """Score every ROI in one recording and write the keep-mask.
+
+    Parameters
+    ----------
+    rec_id
+        Human-readable recording id (used only for the kept-count
+        log line at the end). Pass an empty string if you don't
+        have one; ``infer_recording_id(plane0)`` can supply it.
+    model, device
+        Loaded ``CellFilter`` and target torch device.
+    plane0
+        Suite2p plane0 folder for the recording. Required;
+        recordings are not looked up by id.
+
+    Steps:
+        1. Open a ``_RecordingCache`` (lazy-loads mean image, max
+           projection, dF/F memmap, stat).
+        2. Loop over all N ROIs:
+            a. ``rec.get_patch(roi, 32)`` -> (3, H, W) numpy array.
+            b. ``rec.get_trace(roi)``     -> (T,) numpy array.
+            c. ``torch.from_numpy(...)[None]`` adds a batch
+               dimension; ``.to(device)`` ships to GPU if available.
+            d. ``model(spatial, trace_t)`` -> raw logit;
+               ``torch.sigmoid(...).item()`` -> Python float.
+        3. Save ``predicted_cell_prob.npy`` and
+           ``predicted_cell_mask.npy`` in plane0.
+
+    The ``@torch.no_grad()`` decorator on the function disables
+    autograd for the whole call -- saves memory and time at
+    inference.
+    """
+    if plane0 is None:
+        raise ValueError(
+            "predict_recording: plane0 is required "
+            "(recordings are not resolved by id).")
+    rec = _RecordingCache(Path(plane0))
+    N = rec.N
+
+    probs = np.zeros(N, dtype=np.float32)
+    # Score ROIs in batches rather than one host->device transfer + forward
+    # per ROI. All ROIs in a recording share patch shape (3, PATCH_SIZE,
+    # PATCH_SIZE) and trace length T, so they stack cleanly. This is
+    # numerically identical to the per-ROI loop because model.eval() makes
+    # BatchNorm use running stats (no cross-sample leakage), but replaces N
+    # tiny kernel launches / transfers / syncs with N/BATCH of each.
+    BATCH = 256
+    for s in range(0, N, BATCH):
+        e = min(s + BATCH, N)
+        patches = np.stack(
+            [rec.get_patch(roi, C.PATCH_SIZE) for roi in range(s, e)],
+            axis=0)                                       # (B, 3, H, W)
+        traces = np.stack(
+            [rec.get_trace(roi) for roi in range(s, e)],
+            axis=0)                                       # (B, T)
+        spatial = torch.from_numpy(patches).to(device)            # (B, 3, H, W)
+        trace_t = torch.from_numpy(traces)[:, None, :].to(device)  # (B, 1, T)
+        logits = model(spatial, trace_t)                          # (B,)
+        probs[s:e] = torch.sigmoid(logits).cpu().numpy()
+
+    out_prob = rec.plane0 / C.PREDICTED_PROB_NAME
+    out_mask = rec.plane0 / C.PREDICTED_MASK_NAME
+    np.save(out_prob, probs)
+    # Boolean mask: NumPy treats ``probs >= C.THRESHOLD`` as a
+    # vectorised comparison returning a bool array of the same
+    # shape.
+    iscell_path = rec.plane0 / "iscell.npy"
+    mask, big = keep_mask_from_scores(
+        probs, rec.stat, threshold=threshold, size_outlier_z=size_outlier_z,
+        iscell=(np.load(iscell_path)
+                if use_iscell and iscell_path.exists() else None))
+    np.save(out_mask, mask)
+    print(f"{rec_id}: {mask.sum()}/{N} kept "
+          f"({int(big.sum())} dropped as size outliers, z>{size_outlier_z})"
+          f"   -> {out_prob.name}, {out_mask.name}")
+    return out_prob
+
+
+def load_model_from_checkpoint(ckpt_path: Path,
+                               device: torch.device) -> CellFilter:
+    """Build a fresh ``CellFilter``, restore the saved weights, and
+    switch to eval mode. Shared between the CLI here and the
+    standalone curation app which also needs to score every ROI.
+    """
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoint at {ckpt_path}. Train first.")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model = CellFilter().to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model
+
+
+def main(argv: list[str] | None = None):
+    """CLI entry: predict cell-mask for one recording (or many).
+
+    Argument structure (parsed via ``argparse``)
+    -------------------------------------------
+    --plane0 PATH [PATH ...]
+        One or more ``suite2p/plane0`` directories to score.
+        Required.
+    --ckpt PATH
+        Override checkpoint path (defaults to
+        ``CHECKPOINT_DIR/best.pt``).
+    --size-outlier-z Z
+        Post-CNN size gate (defaults to ``config.SIZE_OUTLIER_Z``;
+        ``0`` disables). Pass the same value the recording was
+        detected with so the mask matches Tab 3's.
+
+    Steps
+    -----
+    1. Resolve the checkpoint path.
+    2. Pick the device (CUDA when available, else CPU).
+    3. Build the model + load weights via ``load_model_from_checkpoint``.
+    4. For each ``--plane0`` argument, call ``predict_recording``.
+       Per-recording errors are caught individually so a single
+       missing memmap doesn't kill the batch.
+
+    The input is always an explicit plane0 path (there is no
+    recording-id or scan-everything mode).
+    """
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--plane0", type=str, nargs="+", required=True,
+        help="One or more suite2p/plane0 directories to score.")
+    ap.add_argument(
+        "--ckpt", type=str, default=None,
+        help="Path to checkpoint. Defaults to CHECKPOINT_DIR/best.pt")
+    ap.add_argument(
+        "--size-outlier-z", type=float, default=C.SIZE_OUTLIER_Z,
+        help="Post-CNN size gate: drop kept ROIs whose robust z of "
+             "log(npix) exceeds this (default %(default)s; 0 = off).")
+    args = ap.parse_args(argv)
+
+    ckpt_path = Path(args.ckpt) if args.ckpt else (C.CHECKPOINT_DIR / "best.pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}   ckpt: {ckpt_path}")
+    model = load_model_from_checkpoint(ckpt_path, device)
+
+    from .. import utils as _u
+    for plane0_str in args.plane0:
+        plane0 = Path(plane0_str)
+        if not (plane0 / "stat.npy").exists():
+            print(f"[skip] {plane0}: no stat.npy")
+            continue
+        try:
+            rec_id = _u.infer_recording_id(plane0)
+        except Exception:
+            rec_id = plane0.parent.name
+        try:
+            predict_recording(rec_id, model, device, plane0=plane0,
+                              size_outlier_z=args.size_outlier_z)
+        except Exception as ex:
+            print(f"[skip] {plane0}: {ex}")
+
+
+if __name__ == "__main__":
+    main()

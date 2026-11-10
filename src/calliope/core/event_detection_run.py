@@ -1,0 +1,765 @@
+"""Headless event detection for batch execution and Tab 5.
+
+Why this module exists
+----------------------
+Tab 5's full compute body (per-ROI MAD-z + hysteresis, event-window
+detection, summary writing) lives here rather than inside the tab,
+because Tab 0's batch runner needs to invoke the same logic without a
+Tk window. The tab still owns the matplotlib canvases,
+but its Render button runs the computation through
+:func:`run_event_detection_offload` in a child process (via
+``core.offload.run_offloaded``), and its Export-figures button through
+:func:`export_event_figures_offload`.
+
+Public surface
+--------------
+``run_event_detection(plane0, params, *, figures_dir=None,
+                      write_summary=True, progress_cb=None)``
+    The headless entry point. Loads memmaps, runs MAD-z +
+    hysteresis_onsets per ROI, runs ``detect_event_windows`` on the
+    pooled onsets, optionally renders heatmap / raster / detection
+    figures + writes the events sheets to ``calliope_summary.xlsx``.
+    Returns the same data dict the tab consumes.
+``run_event_detection_offload(plane0_str, params)``
+    Picklable child-process target behind Tab 5's Render button.
+``write_event_summary_offload(plane0_str, data)``
+    Picklable child-process target that writes the summary workbook.
+``export_event_figures_offload(plane0_str, params, figures_root_str)``
+    Picklable child-process target behind Tab 5's Export-figures button.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+
+from . import utils as core_utils
+# NOTE: ``format_roi_indices`` / ``parse_manual_roi_spec`` are imported
+# lazily inside the manual-subset branch below, NOT at module top. They
+# live in ``gui_common``, which drags in customtkinter/tkinter -- and
+# this module is imported in a *child process* by ``core.offload`` for
+# every offloaded detection run (including each recording in a batch).
+# Keeping Tk out of the top-level import shaves ~1s off every child
+# spawn; the helpers are only needed when a manual ROI subset is set.
+
+
+# Knob names that map 1:1 to ``EventDetectionParams`` fields. Kept in
+# sync with Tab 5's PARAM_SPEC -- if you add a knob there, add it
+# here too.
+_EVENT_DETECTION_FIELDS = (
+    "bin_sec", "smooth_sigma_bins", "normalize_by_num_rois",
+    "min_prominence", "min_width_bins", "min_distance_bins",
+    "prominence_wlen_s",
+    "auto_min_prominence", "auto_min_prominence_percentile",
+    "auto_min_prominence_n_shuffles", "auto_min_prominence_seed",
+    "baseline_mode", "baseline_percentile",
+    "baseline_window_s", "noise_quiet_percentile",
+    "noise_mad_factor", "end_threshold_k",
+    "max_walk_duration_s", "max_event_duration_s",
+    "enable_watershed_split", "enforce_symmetric_clamp",
+    "merge_gap_s", "seizure_min_duration_s", "population_fraction",
+    "use_gaussian_boundary", "gaussian_quantile",
+    "gaussian_fit_pad_s", "gaussian_min_sigma_s",
+)
+
+
+def _compute_event_monotonicity(
+    plane0: Path,
+    kept_idx: np.ndarray,
+    A: np.ndarray,
+    first_time: np.ndarray,
+    event_windows,
+    fps: Optional[float],
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    n_shuffles: int = 10000,
+) -> list[dict]:
+    """Return one row per event with directional-monotonicity scalars.
+
+    Per-event rows carry ``event_id, n_active, theta_star_deg,
+    rho_obs, p_value, p_value_fdr, n_shuffles, u_x, u_y``. Rows for events with
+    fewer than 3 active ROIs (or otherwise-degenerate inputs) carry
+    ``n_active`` populated and the rest set to ``None`` so the
+    summary writer knows to leave the value cells blank.
+
+    Centroids come from a fresh ``stat.npy`` read at ``plane0``,
+    indexed by ``kept_idx`` so the row order lines up with the rows
+    of ``first_time`` / ``A``.
+    """
+    if event_windows is None or len(event_windows) == 0:
+        return []
+    try:
+        stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+    except Exception as e:
+        if progress_cb is not None:
+            progress_cb(
+                f"monotonicity: stat.npy unreadable ({e}); skipping")
+        return []
+
+    kept_idx = np.asarray(kept_idx, dtype=int)
+    try:
+        xs_all = np.array(
+            [float(np.median(np.asarray(stat[i]["xpix"])))
+             for i in kept_idx], dtype=float)
+        ys_all = np.array(
+            [float(np.median(np.asarray(stat[i]["ypix"])))
+             for i in kept_idx], dtype=float)
+    except (IndexError, KeyError, ValueError) as e:
+        if progress_cb is not None:
+            progress_cb(
+                f"monotonicity: stat mismatch ({e}); skipping")
+        return []
+
+    # Lazy import: ``spatial`` pulls matplotlib via the cyan->red
+    # cmap; importing at module top would load mpl in every headless
+    # caller that never touches monotonicity.
+    from .spatial import directional_monotonicity_spearman
+
+    A_arr = np.asarray(A, dtype=bool)
+    first = np.asarray(first_time, dtype=float)
+    n_events = int(A_arr.shape[1]) if A_arr.ndim == 2 else 0
+    rows: list[dict] = []
+    for ev_idx in range(n_events):
+        active = A_arr[:, ev_idx] & ~np.isnan(first[:, ev_idx])
+        n_active = int(active.sum())
+        base = {
+            "event_id": ev_idx,
+            "n_active": n_active,
+            "theta_star_deg": None,
+            "rho_obs": None,
+            "p_value": None,
+            "p_value_fdr": None,
+            "n_shuffles": None,
+            "u_x": None,
+            "u_y": None,
+        }
+        if n_active < 3:
+            rows.append(base)
+            continue
+        xs = xs_all[active]
+        ys = ys_all[active]
+        # Spearman is rank-only so frames vs seconds is equivalent;
+        # use integer frame indices when fps is known so the result
+        # matches any downstream re-run of the sweep on frame indices.
+        if fps:
+            ts = np.rint(first[active, ev_idx] * float(fps)).astype(int)
+        else:
+            ts = first[active, ev_idx]
+        try:
+            result = directional_monotonicity_spearman(
+                xs, ys, ts, n_angles=360, n_shuffles=int(n_shuffles),
+                seed=0)
+        except Exception:
+            rows.append(base)
+            continue
+        if not result:
+            rows.append(base)
+            continue
+        theta = float(result["theta_star"])
+        rho = float(result["rho_obs"])
+        rows.append({
+            "event_id": ev_idx,
+            "n_active": n_active,
+            "theta_star_deg": float(np.degrees(theta)),
+            "rho_obs": rho,
+            "p_value": float(result["p_value"]),
+            "p_value_fdr": None,  # filled in below
+            "n_shuffles": int(result["null_rho"].size),
+            "u_x": float(np.cos(theta)),
+            "u_y": float(np.sin(theta)),
+        })
+
+    # Multiple-comparison correction across the per-event Spearman tests.
+    # With ~tens-to-hundreds of events per recording and many recordings
+    # per dataset, the uncorrected p-values inflate false positives. BH-FDR
+    # (Benjamini & Hochberg 1995) is the field-standard control for the
+    # expected false-discovery rate; ``_bh_fdr`` is the same pure-NumPy
+    # implementation used for the CCG significance matrix.
+    valid_idx = [
+        i for i, r in enumerate(rows) if r.get("p_value") is not None]
+    if valid_idx:
+        from .crosscorrelation import _bh_fdr
+        p_raw = np.array([rows[i]["p_value"] for i in valid_idx],
+                         dtype=np.float64)
+        p_fdr = _bh_fdr(p_raw)
+        for i, q in zip(valid_idx, p_fdr):
+            rows[i]["p_value_fdr"] = float(q)
+
+    if progress_cb is not None and rows:
+        n_valid = sum(1 for r in rows if r.get("rho_obs") is not None)
+        progress_cb(
+            f"monotonicity: scored {n_valid}/{len(rows)} events "
+            f"(>=3 active ROIs)")
+    return rows
+
+
+def _build_event_params(params: dict):
+    """Translate the flat ``params`` dict into an
+    :class:`EventDetectionParams` instance, using class defaults for
+    any missing field.
+    """
+    obj = core_utils.EventDetectionParams()
+    for fname in _EVENT_DETECTION_FIELDS:
+        if fname in params:
+            try:
+                setattr(obj, fname, params[fname])
+            except Exception:
+                pass
+    return obj
+
+
+def _read_tau(plane0: Path) -> float:
+    """Indicator OASIS decay tau (s) for this recording, or 0.0 if unknown.
+
+    Prefers the meta.json sidecar, falls back to suite2p's ``ops.npy`` (which
+    always carries ``tau``); both behind defensive reads so a missing/corrupt
+    file just yields 0.0.
+    """
+    try:
+        from .recording_meta import read_meta
+        t = (read_meta(plane0).get("extraction") or {}).get("tau_seconds")
+        if t:
+            return float(t)
+    except Exception:
+        pass
+    try:
+        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        return float(ops.get("tau") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _positive_float(value) -> Optional[float]:
+    """``float(value)`` when it is a finite number > 0, else ``None``."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) and v > 0.0 else None
+
+
+def _read_lowpass_filtered_meta(plane0: Path) -> dict:
+    """The ``lowpass_filtered`` meta.json section that
+    :func:`core.lowpass_run.compute_lowpass_and_dt` (Tab 4 / batch) stamps
+    when it writes the ``r0p7_filtered_dff_lowpass`` / ``_dt`` memmaps this
+    module reads ({} if absent or unreadable)."""
+    try:
+        from .recording_meta import read_meta
+        sec = read_meta(plane0).get("lowpass_filtered")
+        return sec if isinstance(sec, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_cutoff_hz(plane0: Path, params: dict) -> float:
+    """Low-pass cutoff (Hz) the input memmaps were filtered at.
+
+    Precedence: an explicit ``params['cutoff_hz']`` (the merged batch row)
+    > ``meta.json`` ``lowpass_filtered.cutoff_hz`` (stamped by
+    :func:`core.lowpass_run.compute_lowpass_and_dt`, so the GUI path sees
+    Tab 4's slider value) > 1.0 Hz (the Tab 4 default).
+    """
+    v = _positive_float(params.get("cutoff_hz"))
+    if v is None:
+        v = _positive_float(
+            _read_lowpass_filtered_meta(plane0).get("cutoff_hz"))
+    return v if v is not None else 1.0
+
+
+def _resolve_fps(plane0: Path, params: dict) -> float:
+    """Frame rate (Hz) for onset timing.
+
+    Precedence: an explicit ``params['fps_override']`` > 0 (matching
+    :func:`core.lowpass_run.run_lowpass`) > ``meta.json``
+    ``lowpass_filtered.fps`` (the rate the lowpass / derivative memmaps
+    were filtered at, so Tab 4 and Tab 5 agree) >
+    :func:`core.utils.get_fps_from_notes` (``ops.npy['fs']``, else
+    ``DEFAULT_FPS``).
+    """
+    v = _positive_float(params.get("fps_override"))
+    if v is None:
+        v = _positive_float(_read_lowpass_filtered_meta(plane0).get("fps"))
+    if v is None:
+        v = float(core_utils.get_fps_from_notes(str(plane0)))
+    return v
+
+
+def _resolve_backtrack_s(value: float, plane0: Path, params: dict) -> float:
+    """Onset-backtrack window (s). ``value > 0`` is an explicit override;
+    otherwise derive it from the recording.
+
+    The foot is found on the low-pass dF/F, so the rise timescale is set by the
+    *slower* of the indicator decay (``tau``) and the low-pass period
+    (``1/cutoff_hz``) -- not the (sub-second) spike. For a fast indicator the
+    low-pass floor dominates (e.g. tau 0.25 s at 1 Hz -> 0.8 s); for a slow one
+    tau dominates (e.g. GCaMP6s 1.5 s -> 1.5 s). The 0.8 coefficient is the
+    empirically-checked foot reach of the 1 Hz low-pass + SG-derivative stage.
+    The cutoff comes from :func:`_resolve_cutoff_hz` (batch param, else the
+    value Tab 4 stamped into meta.json, else 1 Hz).
+    """
+    if value > 0.0:
+        return value
+    cutoff = _resolve_cutoff_hz(plane0, params)
+    return max(_read_tau(plane0), 0.8 / cutoff)
+
+
+def run_event_detection(
+    plane0: Path,
+    params: dict,
+    *,
+    figures_dir: Optional[Path] = None,
+    write_summary: bool = True,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    compute_monotonicity: bool = True,
+) -> dict:
+    """Run Tab 5's full event-detection pipeline on ``plane0``.
+
+    Parameters
+    ----------
+    plane0 : Path
+        Suite2p plane folder (from Tab 3) containing F.npy + the
+        ``r0p7_filtered_dff_lowpass.memmap.float32`` /
+        ``r0p7_filtered_dff_dt.memmap.float32`` memmaps that Tab 4
+        wrote.
+    params : dict
+        Same shape as ``EventDetectionTab._params``: per-ROI
+        hysteresis (``z_enter``, ``z_exit``, ``min_sep_s``), display
+        target (``time_cols_target``), the
+        :class:`EventDetectionParams` fields, plus optional
+        ``onset_source`` (``"derivative"`` (default) or ``"spks"``),
+        ``manual_subset_enabled``, ``manual_roi_spec``, and (batch only)
+        ``cutoff_hz`` / ``fps_override`` -- see :func:`_resolve_cutoff_hz`
+        and :func:`_resolve_fps` for the fallbacks when they are absent.
+    figures_dir : Path or None
+        If set, save heatmap / raster / event-detection PNGs.
+    write_summary : bool
+        If True (default), append events sheets to
+        ``<plane0>/calliope_summary.xlsx`` via
+        :func:`summary_writer.write_events_sheets`.
+    progress_cb : callable
+        Optional ``callback(message)`` for status strings.
+    compute_monotonicity : bool
+        If True (default), run the per-event directional-monotonicity
+        sweep (10,000 shuffles per event). Figure-only callers pass False;
+        ``event_monotonicity`` is then an empty list.
+
+    Returns
+    -------
+    dict
+        Same shape as Tab 5's render payload (heatmap / raster /
+        kept_idx / event_windows / A / first_time / fps / T /
+        N_kept / onsets_by_roi / diagnostics / downsample).
+    """
+    plane0 = Path(plane0)
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+
+    lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
+    dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
+    if not lp_path.exists() or not dt_path.exists():
+        raise FileNotFoundError(
+            f"Missing low-pass memmaps in {plane0}. "
+            "Run Tab 4 (or core.lowpass_run.run_lowpass) first.")
+
+    # Size the memmaps against the mask they were *written* with (persisted
+    # as r0p7_cell_mask_bool.npy), not whatever the live mask resolves to
+    # now -- a drifted mask makes np.memmap request a wrong-sized mapping,
+    # which Windows reports as [WinError 8]. See utils.resolve_filtered_mask.
+    mask, N_kept_full = core_utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=lp_path, T=T)
+    if N_kept_full == 0:
+        raise RuntimeError("No ROIs survive the cell-filter mask.")
+
+    lowpass = np.memmap(str(lp_path), dtype="float32", mode="r",
+                        shape=(T, N_kept_full))
+    # ``derivative`` is mapped lazily once onset_source is known (below): the
+    # spks onset path never reads it, so there's no need to open the handle.
+    derivative = None
+
+    kept_full_idx = np.flatnonzero(mask)
+    pos_in_memmap = np.arange(N_kept_full)
+    kept_idx = kept_full_idx.copy()
+
+    if params.get("manual_subset_enabled"):
+        # Lazy import (keeps Tk out of the child-process import path).
+        from ..gui_common import format_roi_indices, parse_manual_roi_spec
+        spec = params.get("manual_roi_spec", "")
+        try:
+            manual_ids = parse_manual_roi_spec(spec, N_total)
+        except ValueError as e:
+            raise RuntimeError(
+                f"Manual ROI spec invalid: {e!s} (input {spec!r})")
+        sid_to_pos = {int(sid): pos
+                      for pos, sid in enumerate(kept_full_idx)}
+        valid: list[tuple[int, int]] = []
+        skipped: list[int] = []
+        for sid in manual_ids:
+            if sid in sid_to_pos:
+                valid.append((sid, sid_to_pos[sid]))
+            else:
+                skipped.append(sid)
+        if not valid:
+            raise RuntimeError(
+                f"None of the manual ROI ids survive the keep mask "
+                f"(skipped: {skipped[:8]}"
+                + (' ...' if len(skipped) > 8 else '') + ').')
+        if skipped and progress_cb is not None:
+            progress_cb(
+                f"manual ROI ids skipped (not in keep mask): "
+                f"{format_roi_indices(skipped)}")
+        kept_idx = np.array([sid for sid, _ in valid], dtype=int)
+        pos_in_memmap = np.array([pos for _, pos in valid], dtype=int)
+
+    N_kept = int(pos_in_memmap.size)
+
+    fps = _resolve_fps(plane0, params)
+
+    z_enter = float(params.get("z_enter", 3.5))
+    z_exit = float(params.get("z_exit", 1.5))
+    min_sep_s = float(params.get("min_sep_s", 0.1))
+    min_rise_dff = float(params.get("min_rise_dff", 0.0))
+    onset_backtrack_s = _resolve_backtrack_s(
+        float(params.get("onset_backtrack_s", 0.0)), plane0, params)
+    time_cols_target = int(params.get("time_cols_target", 1200))
+
+    downsample = max(1, T // time_cols_target)
+    num_cols = T // downsample
+    heatmap = np.zeros((N_kept, num_cols), dtype=np.uint8)
+    raster = np.zeros((N_kept, num_cols), dtype=np.uint8)
+    event_counts = np.zeros(N_kept, dtype=np.int32)
+    onsets_by_roi: list = []
+
+    onset_source = params.get("onset_source", "derivative")
+    spks_arr = None
+    if onset_source == "spks":
+        spks_arr = core_utils.s2p_load_spks(plane0, kept_full_idx)
+    else:
+        # Only open the derivative memmap when the loop will actually read it.
+        derivative = np.memmap(str(dt_path), dtype="float32", mode="r",
+                               shape=(T, N_kept_full))
+
+    report_every = max(1, N_kept // 20)
+    # ``lowpass`` / ``derivative`` are C-order (T, N) memmaps, so a single
+    # column is maximally strided -- a per-ROI column read faults essentially
+    # every page of the file, so N reads scan the whole (multi-GB) file N
+    # times. Read a band of COLS columns into RAM at once (gathered by
+    # pos_in_memmap; a contiguous slice in the default path), then iterate the
+    # in-memory columns. mad_z / hysteresis_onsets are per-column, so results
+    # are identical; this just bounds the strided I/O to ceil(N_kept/COLS)
+    # passes over the file.
+    COLS = 256
+    for b0 in range(0, N_kept, COLS):
+        b1 = min(N_kept, b0 + COLS)
+        sel = pos_in_memmap[b0:b1]
+        lp_block = np.asarray(lowpass[:, sel], dtype=np.float32)
+        if onset_source == "spks":
+            src_block = np.asarray(spks_arr[:, sel], dtype=np.float32)
+        else:
+            src_block = np.asarray(derivative[:, sel], dtype=np.float32)
+
+        for k in range(b1 - b0):
+            i = b0 + k
+            lp_i = lp_block[:, k]
+            src_i = src_block[:, k]
+            z, _, _ = core_utils.mad_z(src_i)
+            onsets = core_utils.hysteresis_onsets(
+                z, z_enter, z_exit, fps, min_sep_s=min_sep_s)
+            # Backtrack each crossing to the foot of its rise on the low-pass
+            # dF/F (fixes mid-rise timing); optionally drop sub-``min_rise_dff``
+            # excursions (absolute dF/F floor, off by default).
+            onsets = core_utils.refine_onsets(
+                onsets, lp_i, fps, min_rise_dff=min_rise_dff,
+                backtrack_s=onset_backtrack_s)
+            event_counts[i] = onsets.size
+            onsets_by_roi.append(np.asarray(onsets, dtype=np.float64) / fps)
+
+            if downsample > 1:
+                trimmed = lp_i[:num_cols * downsample].reshape(
+                    num_cols, downsample)
+                lp_ds = trimmed.mean(axis=1)
+                if onsets.size:
+                    bins = (onsets // downsample).clip(0, num_cols - 1)
+                    raster[i, np.unique(bins)] = 1
+            else:
+                lp_ds = lp_i
+                if onsets.size:
+                    raster[i, onsets.clip(0, num_cols - 1)] = 1
+
+            lo, hi = np.percentile(
+                lp_ds,
+                [core_utils.DISPLAY_CLIP_LOW_PCT,
+                 core_utils.DISPLAY_CLIP_HIGH_PCT])
+            if hi <= lo:
+                heatmap[i, :] = 0
+            else:
+                norm = np.clip((lp_ds - lo) / (hi - lo), 0, 1)
+                heatmap[i, :] = (norm * 255.0 + 0.5).astype(np.uint8)
+
+            if progress_cb is not None and (i + 1) % report_every == 0:
+                progress_cb(f"event detection: {i + 1}/{N_kept} ROIs")
+
+    order = np.argsort(-event_counts)
+    heatmap = heatmap[order]
+    raster = raster[order]
+
+    ed_kwargs: dict = {"params": _build_event_params(params)}
+    event_windows, A, first_time, diagnostics = \
+        core_utils.detect_event_windows(
+            onsets_by_roi, T=T, fps=fps,
+            return_diagnostics=True, **ed_kwargs,
+        )
+
+    # Within-event timing (Tabs 7/8, monotonicity): half-max crossings on
+    # lightly filtered dF/F instead of the detection onsets.
+    # A (who took part) still comes from the onsets.
+    dff_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    if (params.get("timing_method", "half-max") == "half-max"
+            and dff_path.exists() and A.size):
+        dff = np.memmap(str(dff_path), dtype="float32", mode="r",
+                        shape=(T, N_kept_full))
+        first_time = core_utils.half_max_first_times(
+            dff[:, pos_in_memmap], fps, event_windows, A,
+            cutoff_hz=float(params.get("timing_cutoff_hz", 5.0)))
+        del dff
+
+    # ---- Per-event directional monotonicity --------------------------
+    # For every detected population event, run the Spearman-rank
+    # propagation-direction test (``core.spatial.
+    # directional_monotonicity_spearman``) on the participating ROIs.
+    # The scalars (``theta*, rho_obs, p_value, u_x, u_y``) land in the
+    # returned data dict (Tab 5 also publishes them on AppState for any
+    # consumer that only needs the scalars) and in the
+    # ``EventMonotonicity`` summary sheet below. Tab 8 does NOT read
+    # them: its plots need the full rho curve + null distribution, which
+    # these rows don't carry, so it re-runs the sweep itself.
+    if compute_monotonicity:
+        event_monotonicity = _compute_event_monotonicity(
+            plane0, kept_idx, A, first_time, event_windows, fps,
+            progress_cb=progress_cb,
+        )
+    else:
+        event_monotonicity = []
+
+    data = {
+        "heatmap": heatmap,
+        "raster": raster,
+        "kept_idx": kept_idx,
+        "pos_in_memmap": pos_in_memmap,
+        "N_kept_full": N_kept_full,
+        "event_counts": event_counts,
+        "diagnostics": diagnostics,
+        "event_windows": event_windows,
+        "event_class": (diagnostics or {}).get("event_class"),
+        "A": A,
+        "first_time": first_time,
+        "onsets_by_roi": onsets_by_roi,
+        "fps": fps,
+        "T": T,
+        "N_kept": N_kept,
+        "downsample": downsample,
+        "event_monotonicity": event_monotonicity,
+    }
+
+    if figures_dir is not None:
+        figs = _render_event_figures(data, figures_dir=Path(figures_dir))
+        data["figures"] = figs
+
+    if write_summary:
+        from . import summary_writer
+        summary_writer.update_recording_meta(
+            plane0, fps=fps, T=T, N=N_kept)
+        summary_writer.write_events_sheets(
+            plane0,
+            event_windows=event_windows,
+            onsets_by_roi=onsets_by_roi,
+            fps=fps,
+            in_seconds=True,
+            roi_ids=kept_idx,
+            event_classes=data["event_class"],
+        )
+        # One row per event; ``EventMonotonicity`` sheet stamps the
+        # propagation-direction scalars next to the existing
+        # ``EventWindows`` / ``EventOnsets`` / ``RoiEventTimes`` so
+        # downstream analyses can stack monotonicity stats across
+        # recordings the same way they already do for event counts.
+        if event_monotonicity:
+            summary_writer.write_event_monotonicity_sheet(
+                plane0, event_monotonicity)
+
+    return data
+
+
+def run_event_detection_offload(plane0_str: str, params: dict, *,
+                                progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 5.
+
+    Runs in a child process so the GUI stays responsive (the per-ROI
+    hysteresis loop is pure-Python and would otherwise hold the GIL).
+    Takes only picklable inputs (a path *string* + a plain param dict),
+    re-opens the lowpass/derivative memmaps by path inside the child via
+    :func:`run_event_detection`, and returns the same picklable payload
+    Tab 5 renders. ``write_summary`` stays False: the tab writes the
+    workbook on the main thread after rendering.
+    """
+    from .offload import make_progress_cb
+    return run_event_detection(
+        Path(plane0_str), dict(params),
+        figures_dir=None,
+        write_summary=False,
+        progress_cb=make_progress_cb(progress_q),
+    )
+
+
+def write_event_summary_offload(plane0_str: str, data: dict, *,
+                                progress_q=None) -> str:
+    """Picklable :mod:`calliope.core.offload` target: Tab 5's summary
+    workbook write (Recording, event and EventMonotonicity sheets).
+
+    openpyxl re-reads and re-saves the whole workbook on every call, which
+    is slow enough to freeze the GUI on the Tk thread. Here it runs in a
+    child process, in one open.
+    """
+    from . import summary_writer as sw
+    plane0 = Path(plane0_str)
+    # Batch passes numpy arrays here, so no `x or []` (ambiguous truth value).
+    # The size line printed below is a diagnostic for summary-write cost.
+    wins = data.get("event_windows")
+    wins = [] if wins is None else wins
+    ons = data.get("onsets_by_roi")
+    ons = [np.asarray(o, dtype=float) for o in ([] if ons is None else ons)]
+    n_rows = sum(int(((o >= s) & (o <= e)).sum()) for s, e in wins for o in ons)
+    print(f"[event-summary] {plane0}: N={data.get('N_kept')} T={data.get('T')} "
+          f"fps={data.get('fps')} windows={len(wins)} "
+          f"onsets={sum(o.size for o in ons)} EventOnsets rows={n_rows}",
+          flush=True)
+    extra = {"Recording": sw.update_recording_meta(
+        plane0, fps=data.get("fps"), T=data.get("T"), N=data.get("N_kept"),
+        write=False)}
+    em = data.get("event_monotonicity")
+    if em:
+        extra["EventMonotonicity"] = sw.write_event_monotonicity_sheet(
+            plane0, em, write=False)
+    return str(sw.write_events_sheets(
+        plane0, event_windows=data.get("event_windows"),
+        onsets_by_roi=ons,
+        fps=data.get("fps"), in_seconds=True, extra_sheets=extra,
+        event_classes=data.get("event_class"),
+        roi_ids=data.get("kept_idx")))
+
+
+def export_event_figures_offload(plane0_str: str, params: dict,
+                                 figures_root_str: str, *,
+                                 progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 5's
+    Export-figures button (also called in-process by the batch path).
+
+    Re-runs detection (skipping the monotonicity sweep the figures don't
+    use), saves the heatmap / raster / event-detection PNG + SVG under
+    ``<figures_root>/event_detection/`` and merges ``params`` into the
+    export manifest. Returns a small picklable payload
+    ``{"events_dir", "manifest", "figures"}``.
+    """
+    from .offload import make_progress_cb
+    from .export_manifest import write_export_manifest
+    plane0 = Path(plane0_str)
+    figures_root = Path(figures_root_str)
+    events_dir = figures_root / "event_detection"
+    params = dict(params)
+    data = run_event_detection(
+        plane0, params,
+        figures_dir=events_dir,
+        write_summary=False,
+        progress_cb=make_progress_cb(progress_q),
+        compute_monotonicity=False,
+    )
+    manifest_path = write_export_manifest(
+        figures_root, rec_id=core_utils.safe_recording_id(plane0),
+        params=params, plane0=plane0, ckpt_path=None)
+    return {
+        "events_dir": str(events_dir),
+        "manifest": str(manifest_path),
+        "figures": list(data.get("figures", [])),
+    }
+
+
+def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
+    """Save the heatmap, event raster, and event-detection diagnostic
+    plots that Tab 5 normally shows live, as PNGs under
+    ``figures_dir``.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+
+    hm = data["heatmap"]
+    rs = data["raster"]
+    fps = data["fps"]; T = data["T"]; ds = data["downsample"]
+    bin_ms = ds * 1000.0 / fps if fps > 0 else 0.0
+
+    def _extent(m):  # x axis in seconds rather than display bins
+        return (0.0, m.shape[1] * ds / fps if fps > 0 else m.shape[1],
+                m.shape[0], 0)
+
+    fig = plt.Figure(figsize=(9, 4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    ax.imshow(hm, aspect="auto", interpolation="nearest", extent=_extent(hm))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
+    ax.set_ylabel("ROIs (most active at top)")
+    ax.set_title("Low-pass dF/F heatmap")
+    p = figures_dir / "heatmap.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    fig = plt.Figure(figsize=(9, 4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys",
+              extent=_extent(rs))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
+    ax.set_ylabel("ROIs (most active at top)")
+    ax.set_title("Onset raster")
+    p = figures_dir / "raster.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    fig = plt.Figure(figsize=(9, 4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    duration_s = float(T) / float(fps) if fps > 0 else 1.0
+    try:
+        diagnostics = data["diagnostics"]
+        core_utils.plot_event_detection(diagnostics, ax=ax)
+        ev = data["event_windows"]
+        if ev is not None and len(ev) > 0:
+            core_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20,
+                                           classes=data.get("event_class"))
+        ax.set_xlim(0.0, duration_s)
+        # Mirror the Tab 5 GUI fit: anchor ymin=0 and put ymax at the
+        # tallest detected peak + 10% headroom. ``peak_height`` is the
+        # smoothed-density value at each picked peak, so it's by
+        # construction the highest point the user cares about.
+        peak_h = np.asarray(
+            diagnostics.get("peak_height", []), dtype=float)
+        finite = peak_h[np.isfinite(peak_h)] if peak_h.size else peak_h
+        ymax = float(finite.max()) if finite.size else 1.0
+        if ymax <= 0:
+            ymax = 1.0
+        ax.set_ylim(0.0, ymax * 1.10)
+    except Exception as e:
+        ax.text(0.5, 0.5, f"plot_event_detection error:\n{e}",
+                ha="center", va="center", transform=ax.transAxes)
+    p = figures_dir / "event_detection.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    return written

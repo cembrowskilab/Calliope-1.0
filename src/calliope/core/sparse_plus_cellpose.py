@@ -1,0 +1,1055 @@
+"""Sparsery + Cellpose detection (no adaptive threshold search).
+
+Why this file exists
+--------------------
+Suite2p ships with a detector called **Sparsery** that finds bright,
+sparse, time-varying spots -- it works very well on the kind of cells
+that fire often during a recording but misses cells that happen to
+stay quiet. To catch the quiet ones we run a second detector,
+**Cellpose** (a generalist deep-learning cell segmentation model from
+Stringer & Pachitariu), on the recording's *mean image* and merge any
+non-overlapping new ROIs into Suite2p's set. The combined ROI list
+then goes through Suite2p's normal extraction pipeline (fluorescence
+trace + neuropil + deconvolution + iscell classifier).
+
+Pipeline at a glance
+--------------------
+1. ``run_one_pass``    -- Suite2p's Sparsery detector, fixed ops (no
+                          binary search). Returns ``stat`` (a list,
+                          one per ROI) and ``ops`` (image dict).
+2. ``run_cellpose_pass`` -- Cellpose on ``ops['meanImg']``. Returns
+                          its own ``stat`` list.
+3. ``filter_non_overlapping_cellpose`` -- drop Cellpose ROIs whose
+                          pixels are already covered by a Sparsery
+                          ROI. Threshold = ``CELLPOSE_MERGE_MAX_OVERLAP``.
+4. ``merge_and_extract`` -- concatenate the two stat lists, run
+                          Suite2p ``extract`` to get F / Fneu / spks,
+                          run Suite2p's ``classify`` to label
+                          cell / not-cell, write everything to
+                          ``final_dir/suite2p/plane0``.
+
+Tab 3 calls this module's :func:`run` when the user clicks "Run
+detection" (the headless :func:`calliope.core.detection_run.run_detection`
+calls it too). Inputs:
+
+- The shifted TIFF stack from Tab 1.
+- Base settings (calliope's 2-photon defaults) come from
+  ``calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS`` in source.
+  Per-session edits flow in via Tab 3's "Edit suite2p settings..."
+  popout as a ``settings_override`` dict.
+- The recording's tau (GCaMP decay constant) from Tab 3's
+  GCaMP-variant picker, passed in as ``tau_override``.
+
+suite2p *invocation* (registration, the detection passes) goes through
+:mod:`calliope.core.suite2p_pipeline`; this file is the orchestrator
+that wires sparsery + cellpose together and calls suite2p's
+``roi_stats`` / ``extract`` / ``dcnv`` / ``classification`` directly to
+process the merged ROI list.
+
+Standalone use (edit ``TIFF_FOLDER`` / ``SAVE_FOLDER`` below first)::
+
+    python -m calliope.core.sparse_plus_cellpose
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import time
+from pathlib import Path
+
+import numpy as np
+
+# The bare ``import suite2p`` is deliberate even though the top-level
+# name is unused (hence the F401 suppression on that line): suite2p's
+# own ``__init__`` does some environment setup we want to trigger.
+import suite2p   # noqa: F401
+# ``roi_stats``: recompute the per-ROI stat dict (npix, lam, ypix...)
+# after we mutate the ROI list. Needed because we splice Cellpose
+# ROIs into Sparsery's list mid-pipeline.
+from suite2p.detection.stats import roi_stats
+# ``extract``: pull each ROI's raw fluorescence trace + a surrounding
+# "neuropil" ring trace. ``dcnv``: run the OASIS deconvolution that
+# produces the spks.npy estimated-firing-rate trace.
+from suite2p.extraction import extract, dcnv
+# ``classification``: Suite2p's built-in cell/not-cell classifier
+# that writes iscell.npy.
+from suite2p import classification
+# ``default_settings`` is the source of truth for the nested 1.0
+# extraction defaults; we deep-merge calliope's overrides on top.
+from suite2p.parameters import default_settings
+
+# Settings loading, the shared-registration cache, the single-pass
+# runners and the ROI-mask builder.
+from .suite2p_pipeline import (
+    Suite2pPipelineConfig,
+    load_base_settings,
+    _get_or_create_shared_registration,
+    _link_or_copy,
+    run_one_pass,
+    run_cellpose_pass,
+    build_roi_pixel_mask,
+    apply_settings_overrides,
+)
+from . import utils
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Standalone-harness paths (only used by ``main()`` below, i.e.
+# ``python -m calliope.core.sparse_plus_cellpose``; the GUI / batch
+# pipeline imports functions and never touches these). They are
+# placeholders: fill in your own input/output folders before running.
+TIFF_FOLDER = r'<path-to-tiff-folder>'
+SAVE_FOLDER = r'<path-to-save-folder>'
+# PATH_TO_OPS is kept None: base settings come from
+# calliope.core.calliope_settings.build_base_settings (in-source).
+# Set to a .npy path here only if you want to override with a saved
+# settings/ops file instead.
+PATH_TO_OPS = None
+
+# Default sparsery ops — no binary search, just one pass with these values.
+# Tab 3's PARAM_SPEC and ``detection_run._build_sparsery_ops`` use the same
+# defaults. Two of these keys cannot affect a sparsery pass (see
+# :func:`inert_sparsery_op_notes`): ``smooth_sigma`` is a registration
+# setting and the pass skips registration, and ``max_iterations`` is a
+# sourcery setting (sparsery is bounded by ``sparsery_settings.max_ROIs``).
+SPARSERY_OPS = {
+    'high_pass':          100,
+    'preclassify':        0.0,
+    'smooth_sigma':       1.0,
+    'sparse_mode':        True,
+    'spatial_scale':      0,      # 0 = auto
+    'threshold_scaling':  0.85,
+    'max_iterations':     1500,
+}
+
+# Default Cellpose configuration.
+CELLPOSE_CFG = {
+    'cellpose_model_type':         'cyto2',
+    'cellpose_diameter':           0,      # 0 = auto
+    # Drop ROIs > this x a typical Cellpose cell (blobs); 0 = off.
+    'cellpose_max_area_factor':    4.0,
+    'cellpose_flow_threshold':     0.8,
+    'cellpose_cellprob_threshold': -1.0,
+    'cellpose_channel_input':      'meanImg',
+    # False = Sparsery only (e.g. no Cellpose model available offline).
+    'cellpose_enabled':            True,
+    # Local model file; '' = cellpose's cached cpsam (downloaded on
+    # first use from huggingface.co into ~/.cellpose/models).
+    'cellpose_model_path':         '',
+}
+
+# Default ``hard_cap`` for :func:`run`. Has no effect with suite2p 1.0 (see
+# ``suite2p_pipeline.hard_cap_note``); sparsery is bounded by max_ROIs.
+HARD_CAP = 60000
+
+# A cellpose ROI is dropped if this fraction of its pixels is already
+# covered by the union of sparsery ROIs.
+CELLPOSE_MERGE_MAX_OVERLAP = 0.3
+
+# Rough peak of Suite2p detection relative to its binned movie (the float32
+# movie plus the normalised / downsampled copies Sparsery makes). This is an
+# uncalibrated estimate (a lower bound of roughly 1.4 is known; the upper bound
+# is not), which is why check_detection_memory only warns and never stops a run.
+DETECTION_MEM_FACTOR = 2.0
+
+
+def available_commit_bytes() -> int | None:
+    """Memory that can still be committed (RAM + page file), in bytes.
+
+    This is what an allocation actually runs into on Windows: once the commit
+    limit is reached, a process fails to start (0xC0000142) or the system
+    stalls, even if free-RAM figures look fine.
+    """
+    try:
+        import ctypes
+
+        class _Perf(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong)] + [(n, ctypes.c_size_t) for n in (
+                "CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable",
+                "SystemCache", "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [
+                (n, ctypes.c_ulong) for n in ("HandleCount", "ProcessCount", "ThreadCount")]
+        p = _Perf(); p.cb = ctypes.sizeof(p)
+        if ctypes.windll.psapi.GetPerformanceInfo(ctypes.byref(p), p.cb):
+            return int((p.CommitLimit - p.CommitTotal) * p.PageSize)
+    except (AttributeError, OSError):          # not Windows
+        pass
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available + psutil.swap_memory().free)
+    except Exception:
+        return None
+
+
+def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
+                           verbose: bool = True) -> int:
+    """Estimate Suite2p detection's peak memory and warn if it may not fit.
+
+    Uses Suite2p's own binning rule (``bin_size = max(1, nframes // nbins,
+    round(tau * fs))`` unless ``detection.bin_size`` is set) and
+    ``DETECTION_MEM_FACTOR``. Warns above 80% of the memory that can still be
+    committed, and always warns (even when not verbose) above 100%. It never
+    stops the run: the factor is uncalibrated. Returns the estimate in bytes.
+    """
+    det = settings.get("detection", {}) or {}
+    bin_size = det.get("bin_size") or max(
+        1, nframes // max(1, int(det.get("nbins") or 5000)),
+        int(round(float(settings.get("tau", 1.0)) * float(settings.get("fs", 10.0)))))
+    need = int(DETECTION_MEM_FACTOR * (nframes // int(bin_size)) * Ly * Lx * 4)
+    avail = available_commit_bytes()
+    if avail is None:
+        return need
+    gb = lambda b: b / 2**30
+    msg = (f"Suite2p detection needs about {gb(need):.1f} GB ({nframes} frames of {Ly}x{Lx}, "
+           f"bin size {bin_size}) but only {gb(avail):.1f} GB can still be committed "
+           f"(RAM + page file).")
+    if need > avail:
+        print(f"[s+cp] WARNING: {msg} The {DETECTION_MEM_FACTOR:g}x estimate is uncalibrated, but "
+              "this run may fail in detection. To be safe, close other programs, enlarge the page "
+              "file on an NTFS drive, or crop/split the recording.", flush=True)
+    elif verbose and need > 0.8 * avail:
+        print(f"[s+cp] WARNING: {msg} Detection may fail if other programs use more memory.")
+    return need
+
+
+class NoRoisDetected(RuntimeError):
+    """Neither detector found any ROI -- the recording is noise. Batch
+    runners finish the row as ``no_rois`` instead of ``failed`` (matched
+    by class name when the error crosses a process boundary as text)."""
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
+                                    Ly: int, Lx: int,
+                                    max_overlap: float,
+                                    verbose: bool = True):
+    """Keep cellpose ROIs whose pixels are mostly *not* covered by
+    Sparsery's existing ROI footprint.
+
+    Why we need this
+    ----------------
+    Sparsery and Cellpose often re-find the same cell. We don't want
+    duplicate ROIs in the final list -- one cell with two ROIs ends
+    up with two near-identical traces and corrupts every downstream
+    statistic (clustering, cross-correlation, etc.). The simplest fix
+    is to keep Sparsery's ROIs as canonical and drop any Cellpose ROI
+    whose pixels are mostly already accounted for.
+
+    Algorithm
+    ---------
+    1. Build a single ``(Ly, Lx)`` boolean image marking every pixel
+       belonging to *any* Sparsery ROI. This is what
+       ``build_roi_pixel_mask`` does under the hood.
+    2. For each Cellpose ROI, compute the fraction of its pixels that
+       fall inside that mask. Keep it if the fraction is below
+       ``max_overlap`` (default 0.3 in the GUI), otherwise drop.
+
+    Returns
+    -------
+    kept : list[dict]
+        The Cellpose stat entries that survived filtering. Will be
+        concatenated with ``sparsery_stat`` by ``merge_and_extract``.
+    """
+    # Single union-of-Sparsery-pixels mask, computed once for speed.
+    sparsery_mask = build_roi_pixel_mask(sparsery_stat, Ly, Lx)
+    kept = []
+    dropped = 0
+    for s in cellpose_stat:
+        # ``np.asarray(...).astype(int)`` defensively coerces whatever
+        # Cellpose returns (sometimes lists, sometimes int64) into the
+        # int dtype we'll use for indexing.
+        yp = np.asarray(s['ypix']).astype(int)
+        xp = np.asarray(s['xpix']).astype(int)
+        # Bounds check: ROIs near the FOV edge can have one or two
+        # pixels rounded slightly out of range; clip those.
+        ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
+        yp = yp[ok]; xp = xp[ok]
+        if yp.size == 0:
+            dropped += 1
+            continue
+        # ``sparsery_mask[yp, xp]`` is fancy indexing -- a vector of
+        # 0/1 telling us, for each Cellpose pixel, whether it's
+        # already inside the Sparsery footprint. Its mean is the
+        # overlap fraction.
+        overlap = float(sparsery_mask[yp, xp].sum()) / float(yp.size)
+        if overlap < max_overlap:
+            kept.append(s)
+        else:
+            dropped += 1
+    if verbose:
+        print(f"    cellpose merge: kept {len(kept)} / {len(cellpose_stat)} "
+              f"ROIs (dropped {dropped} overlapping already-kept ROIs)")
+    return kept
+
+
+def filter_extra_cellpose_passes(sparsery_stat, cellpose_kept, extra_passes,
+                                 Ly: int, Lx: int, max_overlap: float,
+                                 verbose: bool = True):
+    """Filter each extra pass (``[(tag, stat), ...]``) against every ROI
+    already kept -- Sparsery, the mean-image Cellpose pass, then earlier
+    extra passes -- so a cell found twice keeps only its earlier ROI.
+    Returns ``[(tag, kept_stat), ...]``."""
+    already = list(sparsery_stat) + list(cellpose_kept)
+    out = []
+    for tag, stat_list in extra_passes:
+        kept = filter_non_overlapping_cellpose(already, stat_list, Ly, Lx,
+                                               max_overlap=max_overlap, verbose=verbose)
+        out.append((str(tag), kept))
+        already += kept
+    return out
+
+
+def _detection_meta(detection_settings, detect_view, fallback_view) -> dict:
+    """Build ``meta.json``'s ``detection`` section.
+
+    Prefers the settings the sparsery pass ran with: the shared
+    registration (``fallback_view``) only carries the *base* settings,
+    so Tab 3's threshold_scaling / spatial_scale / high_pass would be
+    recorded wrongly from it. ``spatial_scale`` is the requested value
+    (0 = suite2p auto); ``spatscale_pix`` is the scale sparsery resolved,
+    when its ``detect_outputs.npy`` recorded one.
+    """
+    from .suite2p_pipeline import get_setting
+    if detection_settings:
+        algo = detection_settings.get('detection', {}).get('algorithm')
+        out = {
+            "threshold_scaling": get_setting(detection_settings,
+                                             'threshold_scaling'),
+            "sparse_mode": (algo == 'sparsery') if algo else None,
+            "spatial_scale": get_setting(detection_settings, 'spatial_scale'),
+            "highpass_time": get_setting(detection_settings, 'highpass_time'),
+        }
+    else:
+        fallback_view = fallback_view or {}
+        out = {
+            "threshold_scaling": fallback_view.get("threshold_scaling"),
+            "sparse_mode": fallback_view.get("sparse_mode"),
+            "spatial_scale": fallback_view.get("spatial_scale"),
+        }
+    pix = (detect_view or {}).get("spatscale_pix")
+    if pix is not None:
+        try:
+            out["spatscale_pix"] = int(np.asarray(pix).item())
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def inert_sparsery_op_notes(sparsery_ops: dict, base_settings: dict) -> list:
+    """Notes for Tab 3 sparsery params that cannot affect a sparsery pass.
+
+    * ``max_iterations`` is a suite2p *sourcery* setting; sparsery loops
+      up to ``detection.sparsery_settings.max_ROIs``.
+    * ``smooth_sigma`` is a *registration* setting. The sparsery pass
+      reuses the shared registration (built from the base settings) and
+      skips registration, so only a value that differs from the
+      registration's ``smooth_sigma`` is worth flagging.
+
+    A value equal to the ``SPARSERY_OPS`` default is not flagged: the GUI
+    always passes both keys, so flagging defaults would print the same
+    notes on every run and they would stop meaning anything.
+    """
+    from .suite2p_pipeline import get_setting
+    notes = []
+
+    def _is_default(key):
+        try:
+            return float(sparsery_ops[key]) == float(SPARSERY_OPS[key])
+        except (TypeError, ValueError, KeyError):
+            return False
+
+    if 'max_iterations' in sparsery_ops and not _is_default('max_iterations'):
+        max_rois = (base_settings.get('detection', {})
+                    .get('sparsery_settings', {}).get('max_ROIs'))
+        notes.append(
+            f"note: max_iterations={sparsery_ops['max_iterations']} has no "
+            f"effect on sparsery (sourcery-only); sparsery stops at "
+            f"sparsery_settings.max_ROIs={max_rois}")
+    if 'smooth_sigma' in sparsery_ops and not _is_default('smooth_sigma'):
+        reg = get_setting(base_settings, 'smooth_sigma')
+        try:
+            differs = float(sparsery_ops['smooth_sigma']) != float(reg)
+        except (TypeError, ValueError):
+            differs = sparsery_ops['smooth_sigma'] != reg
+        if differs:
+            notes.append(
+                f"note: smooth_sigma={sparsery_ops['smooth_sigma']} is a "
+                f"registration setting and is not applied; registration "
+                f"used registration.smooth_sigma={reg} (edit it in "
+                f"'Edit suite2p settings...')")
+    return notes
+
+
+def _count_leaves(d) -> int:
+    """Number of non-dict leaves in a nested dict."""
+    if not isinstance(d, dict):
+        return 1
+    return sum(_count_leaves(v) for v in d.values())
+
+
+def merge_and_extract(sparsery_stat, cellpose_stat,
+                      shared_plane0: Path, base_settings: dict,
+                      final_dir: Path, max_overlap: float,
+                      verbose: bool = True,
+                      extra_cellpose_passes: "list[tuple[str, list]] | None" = None,
+                      detect_plane0: "Path | None" = None,
+                      detection_settings: "dict | None" = None):
+    """Combine sparsery + non-overlapping cellpose ROIs, then extract
+    fluorescence → dcnv → classify → save into ``final_dir/suite2p/plane0/``.
+
+    This is the heart of Tab 3's "Run detection" worker. Walking
+    through the steps:
+
+    1. **Reuse the registered movie.** Suite2p already wrote the
+       motion-corrected ``data.bin`` and ``ops.npy`` into the shared
+       Sparsery folder. Symlink (or copy) ``data.bin`` over to the
+       final folder so we don't have to re-register the movie.
+    2. **Drop overlapping Cellpose ROIs** with
+       ``filter_non_overlapping_cellpose``. The mean-image Cellpose pass
+       is filtered against the Sparsery mask; each extra pass is then
+       filtered against everything already kept (Sparsery, the
+       mean-image pass and earlier extra passes) by
+       ``filter_extra_cellpose_passes``, so a cell found twice keeps only
+       its earlier ROI.
+    3. **Concatenate** all stat lists into ``combined_raw``, tagging
+       each entry with ``_source`` so its origin can be traced later.
+    4. **Build the final ops dict** by copying registration-time ops
+       and overlaying the trace-extraction knobs from ``base_ops``
+       (tau, fs, neucoeff, baseline window, etc.).
+    5. **Recompute per-ROI stats** with Suite2p's ``roi_stats`` so
+       every dict has the full set of fields (npix, lam normalisation,
+       med, ipix, etc.) that ``extract`` expects.
+    6. **Extract** F / Fneu using Suite2p's neuropil ring extractor.
+    7. **Deconvolve** spks via OASIS (``dcnv``).
+    8. **Classify** cell vs not-cell into ``iscell.npy``.
+    9. **Save** every output (F, Fneu, spks, stat, ops, iscell) into
+       ``final_dir/suite2p/plane0`` -- the same layout Tabs 4-8 expect.
+
+    Parameters
+    ----------
+    sparsery_stat : list of dict
+        ROIs found by Suite2p's Sparsery detector. ``_source`` will
+        be set to ``"sparsery"``.
+    cellpose_stat : list of dict
+        ROIs from the primary Cellpose pass (cyto2 on meanImg in 3.x
+        / SAM on meanImg in 4.x). ``_source`` will be set to
+        ``"cellpose_cyto2"`` -- the tag is kept for compatibility with
+        downstream consumers even when cellpose 4.x runs SAM on meanImg.
+    extra_cellpose_passes : list of (source_tag, stat) tuples, optional
+        Additional Cellpose passes to merge in. The
+        Cellpose-SAM-on-Vcorr pass arrives here with
+        ``source_tag="cellpose_sam"``. Each pass is filtered against all
+        ROIs already kept before concatenation.
+
+    detection_settings : dict, optional
+        The nested settings the sparsery pass actually ran with. Its
+        detection values (threshold_scaling, algorithm, spatial_scale,
+        highpass_time) are stamped into ``meta.json``. ``None`` falls
+        back to the shared-registration view, which only carries the
+        base settings.
+
+    Returns
+    -------
+    (stat_arr, final_ops, final_plane0)
+        The merged per-ROI stat array, the ops dict saved as
+        ``ops.npy``, and the populated ``plane0`` folder (callers
+        publish it on ``AppState.plane0``).
+    """
+    final_plane0 = final_dir / 'suite2p' / 'plane0'
+    final_plane0.mkdir(parents=True, exist_ok=True)
+
+    _link_or_copy(Path(shared_plane0) / 'data.bin',
+                  final_plane0 / 'data.bin')
+    # Load the shared registration's runtime view (Ly, Lx, meanImg, ...)
+    # via load_plane_view, which reads db.npy / settings.npy / reg_outputs.npy
+    # (with a fallback to legacy ops.npy).
+    reg_view = utils.load_plane_view(shared_plane0)
+    Ly, Lx = int(reg_view['Ly']), int(reg_view['Lx'])
+
+    cellpose_kept = filter_non_overlapping_cellpose(
+        sparsery_stat, cellpose_stat, Ly, Lx,
+        max_overlap=max_overlap, verbose=verbose,
+    )
+
+    # Each extra cellpose pass is filtered against everything already kept
+    # (Sparsery + the mean-image pass + earlier extra passes), keeping the
+    # earlier ROI. Nothing downstream de-duplicates (Suite2p extraction just
+    # extracts every ROI it's given), so filtering only against Sparsery would
+    # let a cell found by both Cellpose passes become two ROIs.
+    extra_kept = filter_extra_cellpose_passes(
+        sparsery_stat, cellpose_kept, extra_cellpose_passes or [], Ly, Lx,
+        max_overlap=max_overlap, verbose=verbose)
+
+    combined_raw = []
+    for s in sparsery_stat:
+        combined_raw.append({
+            'ypix': np.asarray(s['ypix']).astype(np.int32),
+            'xpix': np.asarray(s['xpix']).astype(np.int32),
+            'lam':  np.asarray(s['lam']).astype(np.float32),
+            'med':  list(s.get('med', [int(np.median(s['ypix'])),
+                                        int(np.median(s['xpix']))])),
+            '_source': 'sparsery',
+        })
+    for s in cellpose_kept:
+        combined_raw.append({
+            'ypix': np.asarray(s['ypix']).astype(np.int32),
+            'xpix': np.asarray(s['xpix']).astype(np.int32),
+            'lam':  np.asarray(s['lam']).astype(np.float32),
+            'med':  list(s.get('med', [int(np.median(s['ypix'])),
+                                        int(np.median(s['xpix']))])),
+            '_source': 'cellpose_cyto2',
+        })
+    for tag, kept in extra_kept:
+        for s in kept:
+            combined_raw.append({
+                'ypix': np.asarray(s['ypix']).astype(np.int32),
+                'xpix': np.asarray(s['xpix']).astype(np.int32),
+                'lam':  np.asarray(s['lam']).astype(np.float32),
+                'med':  list(s.get('med', [int(np.median(s['ypix'])),
+                                            int(np.median(s['xpix']))])),
+                '_source': tag,
+            })
+
+    n_sp = len(sparsery_stat)
+    n_cp = len(cellpose_kept)
+    if verbose:
+        parts = [f"{n_sp} sparsery", f"{n_cp} cellpose_cyto2"]
+        for tag, kept in extra_kept:
+            parts.append(f"{len(kept)} {tag}")
+        parts_str = " + ".join(parts)
+        print(f"    merged stat: {parts_str} = "
+              f"{len(combined_raw)} total ROIs")
+
+    if not combined_raw:
+        raise NoRoisDetected('Sparsery and Cellpose found no ROIs '
+                             '(merge produced 0 ROIs) -- nothing to extract')
+
+    # Build the flat ops dict that suite2p's extract.create_masks_and_extract
+    # still consumes. Start from the shared-registration's view and overlay
+    # the trace-extraction knobs we care about, pulled from base_settings.
+    from .suite2p_pipeline import get_setting
+    final_ops = dict(reg_view)
+    final_ops['tau'] = float(base_settings.get('tau', final_ops.get('tau', 1.0)))
+    final_ops['fs'] = float(base_settings.get(
+        'fs', final_ops.get('fs', utils.DEFAULT_FPS)))
+    final_ops['neucoeff'] = float(
+        get_setting(base_settings, 'neuropil_coefficient',
+                    final_ops.get('neucoeff', 0.7))
+    )
+    for k in ('baseline', 'win_baseline', 'sig_baseline',
+              'prctile_baseline'):
+        v = get_setting(base_settings, k)
+        if v is not None:
+            final_ops[k] = v
+    bs = get_setting(base_settings, 'batch_size')
+    if bs is not None:
+        final_ops['batch_size'] = bs
+    final_ops['save_path0'] = str(final_dir)
+    final_ops['save_folder'] = 'suite2p'
+    final_ops['reg_file']    = str(final_plane0 / 'data.bin')
+    final_ops['ops_path']    = str(final_plane0 / 'ops.npy')
+    final_ops['do_registration'] = 0
+    final_ops['Ly'] = Ly
+    final_ops['Lx'] = Lx
+
+    det_view = None
+    # Carry the detection-pass projection images (max_proj / Vcorr /
+    # maxImg) into the final ops. Suite2p writes them to the sparsery pass's
+    # detect_outputs.npy, but that pass is a pruned intermediate and
+    # final_ops is built from the registration-only view, which lacks them.
+    # Without this copy the final plane0 has no max projection / correlation
+    # image for the GUI background dropdown, figure export, or reload.
+    if detect_plane0 is not None:
+        try:
+            det_view = utils.load_plane_view(Path(detect_plane0))
+            for _k in ('max_proj', 'Vcorr', 'maxImg'):
+                _v = det_view.get(_k)
+                if isinstance(_v, np.ndarray) and _v.ndim == 2:
+                    final_ops[_k] = _v
+                    if verbose:
+                        print(f"    carried {_k} {tuple(_v.shape)} into "
+                              f"final ops")
+        except Exception as _e:
+            if verbose:
+                print(f"    could not carry detection projections: {_e}")
+
+    median_diam = max(3, int(round(
+        2.0 * float(np.sqrt(np.mean(
+            [len(s['ypix']) for s in combined_raw]
+        ) / np.pi)),
+    )))
+    # suite2p 1.0's roi_stats unpacks ``dy, dx = diameter[0], diameter[1]``,
+    # so pass a 2-element list (square pixels) rather than a scalar. It also
+    # fancy-indexes ``stats[keep_rois]`` with a numpy bool mask, so the input
+    # must be an object ndarray, not a bare Python list.
+    combined_arr = np.array(combined_raw, dtype=object)
+    enriched = roi_stats(combined_arr, Ly, Lx,
+                         diameter=[median_diam, median_diam])
+    for i, s in enumerate(enriched):
+        if '_source' not in s:
+            s['_source'] = combined_raw[i].get('_source', 'sparsery')
+    stat_arr = np.array(enriched, dtype=object)
+
+    if verbose:
+        print(f"    extracting traces for {len(stat_arr)} ROIs")
+    # suite2p 1.0 exposes ``extract.extraction_wrapper(stat, f_reg,
+    # settings=...)``. We open the
+    # registered binary as a BinaryFile (memmap-backed; exposes the .shape
+    # extraction_wrapper expects) and pass settings.extraction through.
+    from suite2p.io import BinaryFile
+    import torch
+    nframes = int(reg_view.get('nframes') or 0)
+    if nframes <= 0:
+        # Fallback when load_plane_view didn't surface nframes (e.g. older
+        # plane folder without db.npy): infer from file size at int16.
+        nframes = (final_plane0 / 'data.bin').stat().st_size // (Ly * Lx * 2)
+    extraction_settings = {
+        **default_settings()['extraction'],
+        **base_settings.get('extraction', {}),
+    }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with BinaryFile(Ly=Ly, Lx=Lx,
+                    filename=str(final_plane0 / 'data.bin'),
+                    n_frames=nframes, write=False) as f_reg:
+        F, Fneu, F_chan2, Fneu_chan2 = extract.extraction_wrapper(
+            stat_arr, f_reg,
+            settings=extraction_settings,
+            device=device,
+        )
+
+    tau = float(final_ops.get('tau', 1.0))
+    fs = float(final_ops.get('fs', utils.DEFAULT_FPS))
+    neucoeff = float(extraction_settings.get('neuropil_coefficient',
+                                             final_ops.get('neucoeff', 0.7)))
+    F_sub = F - neucoeff * Fneu
+    F_pp = dcnv.preprocess(
+        F=F_sub,
+        baseline=final_ops.get('baseline', 'maximin'),
+        win_baseline=float(final_ops.get('win_baseline', 60.0)),
+        sig_baseline=float(final_ops.get('sig_baseline', 10.0)),
+        fs=fs,
+        prctile_baseline=float(final_ops.get('prctile_baseline', 8.0)),
+        # suite2p's dcnv.preprocess defaults device=torch.device('cuda');
+        # pass the device we resolved above (cpu when torch.cuda is
+        # unavailable) so the maximin baseline runs on CPU-only torch
+        # builds instead of raising "Torch not compiled with CUDA enabled".
+        device=device,
+    )
+    spks = dcnv.oasis(
+        F=F_pp, batch_size=int(final_ops.get('batch_size', 3000)),
+        tau=tau, fs=fs,
+    )
+
+    try:
+        iscell = classification.classify(
+            stat=stat_arr, classfile=classification.builtin_classfile,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"    classifier failed ({e}); marking all as cells")
+        iscell = np.ones((len(stat_arr), 2), dtype=np.float32)
+
+    np.save(final_plane0 / 'stat.npy',   stat_arr,  allow_pickle=True)
+    np.save(final_plane0 / 'F.npy',      F)
+    np.save(final_plane0 / 'Fneu.npy',   Fneu)
+    np.save(final_plane0 / 'spks.npy',   spks)
+    np.save(final_plane0 / 'iscell.npy', iscell)
+    # Persist the merged-output ops snapshot. Suite2p's full pipeline would
+    # write its own ops.npy, but extract/dcnv/classify were run by hand on the
+    # shared registration, so write it here so downstream readers
+    # (utils.load_plane_view, spatial overlays, the cellfilter dataset loader)
+    # see a complete view.
+    np.save(final_plane0 / 'ops.npy',    final_ops, allow_pickle=True)
+
+    # Stamp the per-recording parameters known at extraction time into the
+    # meta.json sidecar (single source of truth for downstream consumers and
+    # the NWB exporter). The GCaMP variant *label* is a GUI/headless string
+    # stamped separately by the caller; here we record what is in scope.
+    # A metadata write must never break the pipeline.
+    try:
+        from . import recording_meta
+        recording_meta.update_meta(
+            final_plane0,
+            registration={
+                "block_size": final_ops.get("block_size"),
+                "smooth_sigma": final_ops.get("smooth_sigma"),
+                "nonrigid": final_ops.get("nonrigid"),
+            },
+            detection=_detection_meta(detection_settings, det_view,
+                                      final_ops),
+            extraction={
+                "neuropil_coef": float(neucoeff),
+                "tau_seconds": float(tau),
+            },
+            spike_inference={"backend": "oasis"},
+        )
+    except Exception as _meta_exc:
+        if verbose:
+            print(f"    [meta] could not write meta.json: {_meta_exc}")
+
+    if verbose:
+        n_accept = (int((iscell[:, 0] > 0).sum())
+                    if iscell.ndim == 2 else int((iscell > 0).sum()))
+        print(f"    final: {len(stat_arr)} ROIs "
+              f"({n_accept} classified as cells)")
+
+    return stat_arr, final_ops, final_plane0
+
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+def run(
+    tiff_folder: str | Path,
+    save_folder: str | Path,
+    path_to_ops: str | Path | None = None,
+    sparsery_ops: dict | None = None,
+    cellpose_cfg: dict | None = None,
+    hard_cap: int | None = HARD_CAP,
+    max_overlap: float = CELLPOSE_MERGE_MAX_OVERLAP,
+    tau_override: float | None = None,
+    fps_override: float | None = None,
+    settings_override: dict | None = None,
+    enable_sam_vcorr_pass: bool = False,
+    sam_vcorr_cfg: dict | None = None,
+    verbose: bool = True,
+) -> Path:
+    """Sparsery + cellpose detection. Returns the final ``suite2p/plane0`` path.
+
+    This is the single-call public API Tab 3's worker uses. The full
+    flow:
+
+    1. Build a ``Suite2pPipelineConfig`` (input bundle for the
+       suite2p invocation helpers in
+       :mod:`calliope.core.suite2p_pipeline` -- tau override,
+       optional popout settings override, shared-registration cache).
+    2. ``load_base_settings`` builds the base 2-photon ``(db, settings)``
+       pair from :func:`calliope_settings.build_base_settings` (in source)
+       and overlays any per-session ``settings_override`` (from Tab 3's
+       popout) plus the user-picked GCaMP-variant tau.
+    3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
+       correction once and caches ``data.bin`` + ``ops.npy`` so both
+       Sparsery and Cellpose can reuse it.
+    4. ``run_one_pass`` -- Sparsery detection on the registered movie
+       at the fixed ops up top.
+    5. ``run_cellpose_pass`` -- Cellpose on the mean image, also using
+       the shared registration cache.
+    6. ``merge_and_extract`` -- drop overlapping Cellpose ROIs,
+       concatenate, run Suite2p extract / dcnv / classify, save into
+       ``<save_folder>/final/suite2p/plane0``.
+
+    Parameters
+    ----------
+    tiff_folder : str | Path
+        Folder containing the shifted TIFF(s). Multi-TIFF groups are
+        read as one continuous recording.
+    save_folder : str | Path
+        Where to write ``sparsery_pass``, ``cellpose_pass`` and the
+        final merged ``final/suite2p/plane0`` outputs.
+    path_to_ops : str | Path, optional
+        Legacy override .npy (flat pre-1.0 ops or nested settings).
+        ``None`` (every in-repo caller) uses the in-source
+        ``calliope_settings`` defaults.
+    sparsery_ops, cellpose_cfg : dict, optional
+        Per-detector overrides; fall back to module-level defaults.
+    hard_cap : int, optional
+        Accepted for API compatibility but has no effect with suite2p 1.0
+        (see :func:`suite2p_pipeline.hard_cap_note`); sparsery is bounded
+        by ``detection.sparsery_settings.max_ROIs``.
+    max_overlap : float
+        Cellpose ROIs whose pixels are >= this fraction inside an
+        existing Sparsery ROI are dropped during merge.
+    tau_override : float, optional
+        Per-recording tau scalar (seconds) used for Suite2p
+        deconvolution. The GUI resolves this from the GCaMP-variant
+        picker; ``None`` falls back to the in-source default tau.
+    fps_override : float, optional
+        Acquisition frame rate (Hz) for suite2p ``fs``; ``None`` or
+        <= 0 keeps the base-settings fallback (with a warning).
+    settings_override : dict, optional
+        Nested suite2p settings from Tab 3's "Edit suite2p settings..."
+        popout, deep-merged onto the base settings.
+    enable_sam_vcorr_pass, sam_vcorr_cfg : optional
+        Opt-in Cellpose-SAM second pass on the correlation image.
+    verbose : bool
+        Print step-by-step progress.
+
+    Returns
+    -------
+    final_plane0 : Path
+        The populated ``suite2p/plane0`` folder. Tab 3 publishes this
+        on ``AppState.plane0`` so downstream tabs (lowpass, event
+        detection, ...) can pick it up.
+    """
+    save_root = Path(save_folder)
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    sp_ops = dict(SPARSERY_OPS) if sparsery_ops is None else dict(sparsery_ops)
+    cp_cfg = dict(CELLPOSE_CFG) if cellpose_cfg is None else dict(cellpose_cfg)
+    # ``path_to_ops`` is the legacy back-compat path: when explicit, it
+    # wins. When None, the in-source defaults from
+    # ``calliope.core.calliope_settings.build_base_settings`` are used.
+    ops_path = str(path_to_ops) if path_to_ops else None
+
+    cfg_kwargs = dict(
+        tiff_folder=str(tiff_folder),
+        save_folder=str(save_root),
+        path_to_ops=ops_path,
+        use_cache=False,
+        verbose=verbose,
+    )
+    if tau_override is not None:
+        cfg_kwargs["tau_override"] = float(tau_override)
+    if fps_override is not None and float(fps_override) > 0:
+        cfg_kwargs["fs_override"] = float(fps_override)
+    if settings_override:
+        cfg_kwargs["settings_override"] = dict(settings_override)
+    cfg = Suite2pPipelineConfig(**cfg_kwargs)
+
+    if verbose:
+        if ops_path:
+            print(f'[s+cp] loading base settings from legacy file {ops_path}')
+        else:
+            from . import calliope_settings as _cs
+            n_overrides = _count_leaves(_cs.CALLIOPE_BASE_SETTINGS)
+            tweak = " + popout edits" if settings_override else ""
+            print(f'[s+cp] base settings = suite2p defaults + '
+                  f'{n_overrides} calliope overrides{tweak}')
+    base_db, base_settings = load_base_settings(cfg)
+
+    if verbose:
+        print(f'[s+cp] shared registration')
+    t0 = time.time()
+    shared_plane0 = _get_or_create_shared_registration(
+        cfg, base_db, base_settings,
+    )
+    if verbose:
+        print(f'[s+cp] shared reg ready at {shared_plane0}  '
+              f'({time.time() - t0:.1f}s)')
+
+    # ---- sparsery (one shot, fixed settings) ----
+    if verbose:
+        print(f'[s+cp] sparsery pass '
+              f'(threshold_scaling={sp_ops["threshold_scaling"]})')
+    sparsery_dir = save_root / 'sparsery_pass'
+    sp_settings = {
+        # Copy top-level keys (one level of dicts); deeper nesting is
+        # cloned by apply_settings_overrides as needed.
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in base_settings.items()
+    }
+    apply_settings_overrides(sp_settings, sp_ops)
+    apply_settings_overrides(sp_settings, {'roidetect': True})
+    _rv = utils.load_plane_view(shared_plane0)
+    _Ly, _Lx = int(_rv['Ly']), int(_rv['Lx'])
+    _bin = Path(shared_plane0) / 'data.bin'
+    _nf = int(_rv.get('nframes') or 0) or (_bin.stat().st_size // (_Ly * _Lx * 2) if _bin.exists() else 0)
+    check_detection_memory(_Ly, _Lx, _nf, sp_settings, verbose=verbose)
+    if verbose:
+        for _note in inert_sparsery_op_notes(sp_ops, base_settings):
+            print(f'[s+cp] {_note}')
+    sp_db = dict(base_db)
+    t_sp = time.time()
+    sp_stat, _sp_view, _sp_plane0 = run_one_pass(
+        str(tiff_folder), sparsery_dir, sp_db, sp_settings,
+        verbose=verbose, use_cache=False,
+        shared_plane0=shared_plane0,
+        hard_cap=(hard_cap or 0),
+    )
+    if verbose:
+        print(f'[s+cp] sparsery: {len(sp_stat)} ROIs '
+              f'({time.time() - t_sp:.1f}s)')
+
+    # ---- cellpose (primary pass on meanImg) ----
+    if verbose:
+        print(f'[s+cp] cellpose pass (meanImg)')
+    cp_dir = save_root / 'cellpose_pass'
+    t_cp = time.time()
+    if cp_cfg.get('cellpose_enabled', True):
+        cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
+            cp_dir, shared_plane0, cp_cfg, verbose=verbose,
+        )
+    else:
+        cp_stat = []
+        if verbose:
+            print('[s+cp] cellpose pass skipped (cellpose_enabled=False); '
+                  'Sparsery ROIs only')
+    if verbose:
+        print(f'[s+cp] cellpose: {len(cp_stat)} ROIs '
+              f'({time.time() - t_cp:.1f}s)')
+
+    # ---- cellpose-SAM second pass on the correlation image (Vcorr) ----
+    # This is a recovery pass for cells Sparsery misses: Vcorr lights up pixels
+    # whose timecourse correlates with their neighbours, which is exactly what a soma
+    # looks like even if the cell happens to fire infrequently.
+    # Cellpose-SAM needs cellpose >= 4.0; the check below skips the pass with a
+    # warning otherwise.
+    extra_passes: list[tuple[str, list]] = []
+    if enable_sam_vcorr_pass:
+        from .suite2p_pipeline import cellpose_sam_available
+        if not cellpose_sam_available():
+            if verbose:
+                print('[s+cp] SAM-on-Vcorr requested but cellpose>=4.0 '
+                      'not available; skipping second pass.')
+        else:
+            # Resolve a Vcorr image and persist it next to shared_plane0
+            # so run_cellpose_pass's filesystem fallback can find it.
+            # The Sparsery pass we just ran wrote detect_outputs.npy
+            # into ``sparsery_dir / suite2p / plane0``; pull from there
+            # if available, otherwise stream-compute from data.bin.
+            from .correlation_image import load_or_compute_vcorr
+            sparsery_plane0 = sparsery_dir / 'suite2p' / 'plane0'
+            try:
+                vcorr_src = (sparsery_plane0
+                             if sparsery_plane0.exists()
+                             else shared_plane0)
+                # Pull Ly/Lx/nframes from the shared registration view
+                # so the compute_vcorr fallback path can do its sums
+                # without re-parsing the binary header.
+                reg_view = utils.load_plane_view(shared_plane0)
+                Ly_v = int(reg_view.get('Ly') or 0)
+                Lx_v = int(reg_view.get('Lx') or 0)
+                nframes_v = int(reg_view.get('nframes') or 0)
+                data_bin_path = Path(shared_plane0) / 'data.bin'
+                vcorr = load_or_compute_vcorr(
+                    vcorr_src,
+                    data_bin_path=data_bin_path,
+                    Ly=Ly_v, Lx=Lx_v, nframes=nframes_v,
+                )
+                # Persist in shared_plane0 so run_cellpose_pass's
+                # ``<plane0>/<key>.npy`` filesystem fallback picks it up.
+                np.save(Path(shared_plane0) / 'Vcorr.npy', vcorr)
+                if verbose:
+                    print(f'[s+cp] Vcorr persisted '
+                          f'({vcorr.shape}, range '
+                          f'[{vcorr.min():.3f}, {vcorr.max():.3f}])')
+
+                sam_cfg = dict(sam_vcorr_cfg) if sam_vcorr_cfg else {}
+                # Fill in sensible defaults for the SAM-on-Vcorr pass.
+                # ``cellpose_channel_input='Vcorr'`` is what triggers
+                # the filesystem-fallback lookup in run_cellpose_pass.
+                # ``model_type='cpsam'`` is a recorded label;
+                # cellpose 4.x ignores it (only one model exists).
+                sam_cfg.setdefault('cellpose_model_type', 'cpsam')
+                sam_cfg.setdefault('cellpose_channel_input', 'Vcorr')
+                sam_cfg.setdefault('cellpose_diameter',
+                                   cp_cfg.get('cellpose_diameter', 0))
+                sam_cfg.setdefault('cellpose_flow_threshold',
+                                   cp_cfg.get('cellpose_flow_threshold', 0.8))
+                sam_cfg.setdefault('cellpose_cellprob_threshold',
+                                   cp_cfg.get('cellpose_cellprob_threshold',
+                                              -1.0))
+
+                if verbose:
+                    print(f'[s+cp] cellpose-SAM pass (Vcorr)')
+                t_sam = time.time()
+                sam_dir = save_root / 'cellpose_sam_pass'
+                sam_stat, _sam_ops, _sam_plane0 = run_cellpose_pass(
+                    sam_dir, shared_plane0, sam_cfg, verbose=verbose,
+                )
+                if verbose:
+                    print(f'[s+cp] cellpose-SAM: {len(sam_stat)} ROIs '
+                          f'({time.time() - t_sam:.1f}s)')
+                extra_passes.append(('cellpose_sam', sam_stat))
+            except Exception as e:
+                if verbose:
+                    print(f'[s+cp] SAM-on-Vcorr failed ({e}); '
+                          'continuing with primary cellpose only.')
+
+    # ---- merge + extract ----
+    if verbose:
+        print(f'[s+cp] merging + extracting')
+    final_dir = save_root / 'final'
+    stat_arr, _final_ops, final_plane0 = merge_and_extract(
+        sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
+        max_overlap=max_overlap, verbose=verbose,
+        extra_cellpose_passes=extra_passes or None,
+        detect_plane0=_sp_plane0,
+        detection_settings=sp_settings,
+    )
+
+    if verbose:
+        print(f'\n[s+cp] DONE.')
+        print(f'  plane0:    {final_plane0}')
+        print(f'  stat.npy:  {len(stat_arr)} ROIs')
+        print(f'  F/Fneu/spks/iscell saved')
+    return final_plane0
+
+
+class _LineCallbackWriter(io.TextIOBase):
+    """stdout/stderr stand-in that hands each complete line to ``cb``."""
+
+    def __init__(self, cb) -> None:
+        self._cb, self._buf = cb, ""
+
+    def write(self, s: str) -> int:
+        """Buffer ``s`` and emit each complete line to the callback."""
+        self._buf += s
+        *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            self._cb(line)
+        return len(s)
+
+    def flush(self) -> None:
+        """Emit any buffered partial line to the callback."""
+        if self._buf:
+            self._cb(self._buf)
+            self._buf = ""
+
+
+def run_offload(progress_q=None, **kwargs) -> str:
+    """Picklable :func:`calliope.core.offload.call_in_child` target for
+    Tab 3: runs :func:`run` in a child process so an out-of-memory kill
+    takes down the worker, not the GUI. Everything the run prints is
+    streamed back line by line as progress; returns the plane0 path.
+    """
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q) or (lambda _line: None)
+    writer = _LineCallbackWriter(cb)
+    with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+        try:
+            return str(run(**kwargs))
+        finally:
+            writer.flush()
+
+
+# ============================================================================
+# Module-globals entrypoint (``python -m calliope.core.sparse_plus_cellpose``)
+# ============================================================================
+
+def main():
+    """Run with the module-level config constants.
+
+    Edit ``TIFF_FOLDER``, ``SAVE_FOLDER`` (and optionally
+    ``PATH_TO_OPS``) at the top of this file, then run
+    ``python -m calliope.core.sparse_plus_cellpose`` from an environment
+    with calliope installed for a one-shot detection. (Running the file
+    directly as a script does not work: it uses package-relative
+    imports.) The Tab 3 GUI and ``detection_run.run_detection`` call
+    :func:`run` directly, so they bypass this function entirely.
+    """
+    for _name, _val in (('TIFF_FOLDER', TIFF_FOLDER),
+                        ('SAVE_FOLDER', SAVE_FOLDER)):
+        if str(_val).startswith('<'):
+            raise SystemExit(
+                f"{_name} is still the placeholder {_val!r}; edit it at "
+                f"the top of sparse_plus_cellpose.py first.")
+    run(
+        TIFF_FOLDER, SAVE_FOLDER, PATH_TO_OPS,
+        sparsery_ops=SPARSERY_OPS,
+        cellpose_cfg=CELLPOSE_CFG,
+        hard_cap=HARD_CAP,
+        max_overlap=CELLPOSE_MERGE_MAX_OVERLAP,
+        verbose=True,
+    )
+
+
+if __name__ == '__main__':
+    main()

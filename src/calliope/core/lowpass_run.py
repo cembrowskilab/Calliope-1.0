@@ -1,0 +1,328 @@
+"""Headless low-pass filter + Savitzky-Golay first-derivative
+computation for batch execution and Tab 4.
+
+Why this module exists
+----------------------
+Tab 4's compute loop is kept out of the tab so the batch runner can
+invoke the same code without spinning up a Tk window. This module holds
+the math so both the GUI tab (which still does the interactive plotting
+and slider; its Compute button runs :func:`compute_lowpass_offload` in a
+child process) and the batch runner can call the same function.
+
+Public surface
+--------------
+``compute_lowpass_and_dt(plane0, fps, cutoff_hz, ...)``
+    Read ``r0p7_filtered_dff.memmap.float32``, write
+    ``r0p7_filtered_dff_lowpass.memmap.float32`` and
+    ``r0p7_filtered_dff_dt.memmap.float32``, then stamp the settings
+    into ``meta.json`` ``lowpass_filtered`` (read back by Tab 5).
+``render_lowpass_figures(plane0, fps, cutoff_hz, figures_dir, ...)``
+    Render the same three diagnostic plots Tab 4 shows (FFT, raw
+    trace, zero-phase low-pass preview) for the population-median dF/F
+    and save them as PNG + SVG into ``figures_dir``.
+``run_lowpass(plane0, params, figures_dir=None, progress_cb=None)``
+    Convenience wrapper used by the batch runner: resolves fps + N,
+    runs ``compute_lowpass_and_dt``, and (if ``figures_dir`` is set)
+    renders the diagnostic figures.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+
+from . import utils
+
+
+def _load_kept_count_and_T(plane0: Path) -> tuple[int, int]:
+    """Resolve (T, N_kept) from suite2p outputs at ``plane0``.
+
+    Sizes ``N_kept`` against the source filtered memmap
+    (``r0p7_filtered_dff.memmap.float32``) so the count matches the file
+    the lowpass stage reads, even if the live keep mask has drifted since
+    Tab 3 wrote it -- a drifted mask would otherwise make ``np.memmap``
+    request a wrong-shaped mapping ([WinError 8] on Windows). See
+    ``utils.resolve_filtered_mask``.
+    """
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+    src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    _mask, n_kept = utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=src_path, T=T)
+    if n_kept == 0:
+        raise RuntimeError(f"No ROIs survive the cell-filter mask at {plane0}.")
+    return int(T), n_kept
+
+
+def compute_lowpass_and_dt(
+    plane0: Path,
+    *,
+    fps: float,
+    cutoff_hz: float,
+    filter_order: int = 2,
+    sg_win_ms: int = 333,
+    sg_poly: int = 2,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Run causal Butterworth low-pass + SG first-derivative on every
+    kept ROI in ``plane0``. Writes two ``(T, N_kept)`` float32 memmaps:
+
+        ``r0p7_filtered_dff_lowpass.memmap.float32``
+        ``r0p7_filtered_dff_dt.memmap.float32``
+
+    Returns a summary dict (cutoff, fps, T, N, written paths).
+
+    After both memmaps are flushed, the filter settings are stamped into
+    ``<plane0>/meta.json`` under a ``lowpass_filtered`` section
+    (``cutoff_hz``, ``filter_kind``, ``order``, ``sg_win_ms``,
+    ``sg_poly``, ``fps``). Tab 5 (:mod:`core.event_detection_run`) reads
+    it so its auto onset-backtrack window and frame rate match what was
+    actually baked into these memmaps. The stamp is best-effort: a
+    metadata failure never fails the compute.
+
+    ``progress_cb`` (if provided) is called with status strings such
+    as ``"120/2350 ROIs (3.4s)"`` every ~5% of progress.
+    """
+    plane0 = Path(plane0)
+    src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    if not src_path.exists():
+        raise FileNotFoundError(
+            f"Missing {src_path.name}; run Tab 3 first.")
+    T, N = _load_kept_count_and_T(plane0)
+    src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
+
+    lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
+    dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
+    lp_mm = np.memmap(str(lp_path), dtype="float32", mode="w+", shape=(T, N))
+    dt_mm = np.memmap(str(dt_path), dtype="float32", mode="w+", shape=(T, N))
+
+    sos = None
+    report_every = max(1, N // 20)
+    t0 = time.time()
+    # ``src`` is a C-order (T, N) memmap, so a single column src[:, i] is
+    # maximally strided -- each per-ROI read touches every page of the file,
+    # so N reads scan the whole (multi-GB) file N times. Read a contiguous
+    # band of columns into RAM once per block, then iterate its in-memory
+    # columns; this bounds the strided I/O to ceil(N / col_blk) passes while
+    # preserving the per-ROI sos reuse and streaming semantics.
+    col_blk = max(1, min(N, 256))
+    for j0 in range(0, N, col_blk):
+        j1 = min(N, j0 + col_blk)
+        block = np.ascontiguousarray(src[:, j0:j1])
+        for k in range(j1 - j0):
+            i = j0 + k
+            trace = block[:, k]
+            lp, _, sos = utils.lowpass_causal_1d(
+                trace, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
+                zi=None, sos=sos)
+            dt = utils.sg_first_derivative_1d(
+                lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
+            lp_mm[:, i] = lp
+            dt_mm[:, i] = dt
+            if progress_cb is not None and (i + 1) % report_every == 0:
+                progress_cb(f"{i + 1}/{N} ROIs ({time.time() - t0:.1f}s)")
+
+    lp_mm.flush()
+    dt_mm.flush()
+    del lp_mm, dt_mm, src
+
+    try:
+        from . import recording_meta
+        recording_meta.update_meta(
+            plane0,
+            lowpass_filtered={
+                "cutoff_hz": float(cutoff_hz),
+                "filter_kind": "iir_butter_causal",
+                "order": int(filter_order),
+                "sg_win_ms": int(sg_win_ms),
+                "sg_poly": int(sg_poly),
+                "fps": float(fps),
+            },
+        )
+    except Exception as e:
+        msg = f"[lowpass] meta.json lowpass_filtered stamp failed: {e}"
+        if progress_cb is not None:
+            progress_cb(msg)
+        else:
+            print(msg)
+
+    return {
+        "cutoff_hz": float(cutoff_hz),
+        "fps": float(fps),
+        "T": T,
+        "N": N,
+        "output_files": [str(lp_path), str(dt_path)],
+    }
+
+
+def compute_lowpass_offload(plane0_str: str, *, fps: float, cutoff_hz: float,
+                            filter_order: int = 2, sg_win_ms: int = 333,
+                            sg_poly: int = 2, progress_q=None) -> float:
+    """Picklable :mod:`calliope.core.offload` target for Tab 4.
+
+    Runs the low-pass + derivative write in a child process so the GUI
+    stays responsive. Takes only picklable inputs (path *string* +
+    scalars), re-opens the source memmap by path inside the child, and
+    returns the cutoff so the tab's ``_on_compute_done`` payload is
+    unchanged.
+    """
+    from .offload import make_progress_cb
+    compute_lowpass_and_dt(
+        Path(plane0_str), fps=fps, cutoff_hz=cutoff_hz,
+        filter_order=filter_order, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
+        progress_cb=make_progress_cb(progress_q),
+    )
+    return float(cutoff_hz)
+
+
+def _population_median_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
+    """Compute the population-*median* trace from ``r0p7_filtered_dff`` in
+    chunks so very long recordings don't blow memory.
+
+    Median (not mean) across ROIs: a few ROIs with near-zero baselines have
+    dF/F in the billions (dF/F = (F - F0) / max(F0, 1e-9)), so an arithmetic
+    mean-of-ratios is dominated by those outliers and the trace blows up to
+    ~1e9. The median is robust to them and reflects the typical cell, which is
+    what this diagnostic trace (and its FFT) is meant to show.
+    """
+    src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
+    out = np.zeros(T, dtype=np.float32)
+    chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
+    for t0 in range(0, T, chunk):
+        t1 = min(T, t0 + chunk)
+        out[t0:t1] = np.median(np.asarray(src[t0:t1, :]), axis=1)
+    del src
+    return out
+
+
+def render_lowpass_figures(
+    plane0: Path,
+    *,
+    fps: float,
+    cutoff_hz: float,
+    figures_dir: Path,
+    filter_order: int = 2,
+) -> list[str]:
+    """Render the three diagnostic Tab 4 plots for the population-median
+    filtered dF/F and save them as ``fft.png``, ``raw_dff.png``,
+    ``lowpass_dff.png`` (+ ``.svg``) under ``figures_dir``. Returns the
+    PNG paths.
+
+    Uses the matplotlib ``Agg`` backend so it works in headless batch
+    contexts without a display.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    T, N = _load_kept_count_and_T(plane0)
+    pop_dff = _population_median_filtered_dff(plane0, T, N)
+    label = f"median across {N} kept ROIs"
+
+    yf = np.fft.rfft(pop_dff)
+    xf = np.fft.rfftfreq(pop_dff.size, 1.0 / fps)
+    power = np.abs(yf) ** 2
+    # Diagnostic figure only — zero-phase preview so the overlay
+    # aligns with the raw median-dF/F trace in time. The on-disk lowpass
+    # memmap that feeds event detection is still built with the causal
+    # filter in ``compute_lowpass_and_dt`` above.
+    lp, _ = utils.lowpass_zero_phase_1d(
+        pop_dff, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
+        sos=None)
+    t = np.arange(pop_dff.size, dtype=np.float32) / fps
+
+    written = []
+
+    fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    ax.semilogy(xf[1:], np.maximum(power[1:], 1e-12), lw=0.8, color="black")
+    ax.axvline(cutoff_hz, color="tab:red", lw=1.2, linestyle="--",
+               label=f"cutoff {cutoff_hz:.2f} Hz")
+    ax.set_xlim(0, min(fps / 2.0, 15.0))
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Power (log)")
+    ax.set_title(f"FFT - {label}")
+    ax.legend(loc="upper right", fontsize=8)
+    p = figures_dir / "fft.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    ax.plot(t, pop_dff, lw=0.6, color="black")
+    ax.set_xlim(0, t[-1] if t.size else 1.0)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("dF/F")
+    ax.set_title(f"Raw dF/F - {label}")
+    p = figures_dir / "raw_dff.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
+    ax = fig.add_subplot(111)
+    ax.plot(t, lp, lw=0.7, color="tab:blue")
+    ax.set_xlim(0, t[-1] if t.size else 1.0)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(f"dF/F low-pass @ {cutoff_hz:.2f} Hz")
+    ax.set_title(f"Low-pass - {label}")
+    p = figures_dir / "lowpass_dff.png"
+    fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
+    plt.close(fig)
+    written.append(str(p))
+
+    return written
+
+
+def run_lowpass(
+    plane0: Path,
+    params: dict,
+    *,
+    figures_dir: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Batch-friendly wrapper. ``params`` may include:
+
+      * ``cutoff_hz`` (default 1.0)
+      * ``filter_order`` (default 2)
+      * ``sg_win_ms`` (default 333)
+      * ``sg_poly`` (default 2)
+      * ``fps_override`` (0 or absent -> ``utils.get_fps_from_notes``,
+        i.e. ``ops.npy['fs']`` or ``DEFAULT_FPS``)
+
+    ``figures_dir``, when provided, gets ``fft.png`` /
+    ``raw_dff.png`` / ``lowpass_dff.png`` for the population-median
+    trace.
+    """
+    plane0 = Path(plane0)
+    cutoff = float(params.get("cutoff_hz", 1.0))
+    order = int(params.get("filter_order", 2))
+    sg_win = int(params.get("sg_win_ms", 333))
+    sg_poly = int(params.get("sg_poly", 2))
+    fps_override = float(params.get("fps_override", 0.0) or 0.0)
+    fps = fps_override if fps_override > 0 \
+        else float(utils.get_fps_from_notes(str(plane0)))
+
+    summary = compute_lowpass_and_dt(
+        plane0, fps=fps, cutoff_hz=cutoff,
+        filter_order=order, sg_win_ms=sg_win, sg_poly=sg_poly,
+        progress_cb=progress_cb,
+    )
+    if figures_dir is not None:
+        figs = render_lowpass_figures(
+            plane0, fps=fps, cutoff_hz=cutoff,
+            figures_dir=Path(figures_dir),
+            filter_order=order,
+        )
+        summary["figures"] = figs
+    return summary

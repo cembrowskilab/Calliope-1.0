@@ -1,0 +1,789 @@
+"""calliope.pipeline_gui - top-level CalLIOPE GUI for the calcium imaging
+pipeline.
+
+Application root: creates the main window and stitches all nine tabs
+into a single content host. ``main()`` at the bottom is the entrypoint
+that ``python -m calliope`` calls.
+
+Tabs (each lives in its own subfolder under ``calliope.tabs``):
+    0. Batch runner           -> calliope.tabs.batch.tab.BatchTab
+    1. Input & Preprocess     -> calliope.tabs.preprocess.tab.PreprocessTab
+    2. QC Preview             -> calliope.tabs.qc.tab.QcTab
+    3. Suite2p Detection      -> calliope.tabs.suite2p.tab.Suite2pTab
+    4. Low-pass filter        -> calliope.tabs.lowpass.tab.LowpassTab
+    5. Event detection        -> calliope.tabs.event_detection.tab.EventDetectionTab
+    6. Clustering             -> calliope.tabs.clustering.tab.ClusteringTab
+    7. Cross-correlation      -> calliope.tabs.crosscorrelation.tab.CrossCorrelationTab
+    8. Spatial propagation    -> calliope.tabs.spatial_propagation.tab.SpatialPropagationTab
+
+Shared state (``AppState``) and Tk helpers (advanced-params dialog,
+matplotlib toolbar wrapper, manual-ROI parsing, queue-backed log writer)
+live in ``calliope.gui_common``. Each tab is wrapped by
+``_make_scrollable_tab`` so its contents stay reachable on smaller windows.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Tk ships separately from Python on many Linux distros; pip can't
+# install it, so say how instead of dying with a bare ModuleNotFoundError.
+try:
+    import tkinter  # noqa: F401
+except ModuleNotFoundError:
+    sys.exit("CalLIOPE needs tkinter, which this Python was installed "
+             "without.\nInstall it with your system package manager, e.g. "
+             f"'sudo apt install python{sys.version_info[0]}."
+             f"{sys.version_info[1]}-tk' (Debian/Ubuntu) or 'sudo dnf "
+             "install python3-tkinter' (Fedora), then run calliope again.")
+
+import customtkinter as ctk
+from typing import Optional
+
+# Pillow rasterises an emoji into the window icon.
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+# AppState is the shared pub/sub container every tab subscribes to;
+# apply_ttk_dark_theme re-skins the ttk widgets some tabs still use.
+from .gui_common import AppState, apply_ttk_dark_theme, install_scroll_router
+
+from .tabs.preprocess.tab import PreprocessTab
+from .tabs.qc.tab import QcTab
+from .tabs.batch.tab import BatchTab
+from .tabs.suite2p.tab import Suite2pTab
+from .tabs.lowpass.tab import LowpassTab
+from .tabs.event_detection.tab import EventDetectionTab
+from .tabs.clustering.tab import ClusteringTab
+from .tabs.crosscorrelation.tab import CrossCorrelationTab
+from .tabs.spatial_propagation.tab import SpatialPropagationTab
+
+
+# ---------------------------------------------------------------------------
+# Window icon + scrollable tab wrapper
+# ---------------------------------------------------------------------------
+
+def _render_emoji_icon(emoji: str, size: int = 128) -> Optional[ImageTk.PhotoImage]:
+    """Render ``emoji`` to an RGBA PhotoImage for use with ``Tk.iconphoto``.
+
+    Uses Segoe UI Emoji on Windows (color bitmap glyphs, requires
+    Pillow >= 9 for ``embedded_color=True``). Returns None on failure so
+    the caller can fall back to Tk's default icon without crashing.
+    """
+    # Any Pillow call can raise (missing font, unsupported keyword); a
+    # missing window icon isn't worth crashing for, so return None.
+    try:
+        # Transparent square so the icon has clean edges.
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Try platform colour-emoji fonts in priority order; first to load wins.
+        font = None
+        for candidate in ("seguiemj.ttf", "AppleColorEmoji.ttf",
+                          "NotoColorEmoji.ttf"):
+            try:
+                font = ImageFont.truetype(candidate, int(size * 0.8))
+                break
+            except Exception:
+                continue
+        # Last resort: Pillow's built-in monochrome bitmap font.
+        if font is None:
+            font = ImageFont.load_default()
+
+        # embedded_color needs a newer Pillow; fall back to a flat draw.
+        try:
+            draw.text((size // 2, size // 2), emoji, font=font,
+                      anchor="mm", embedded_color=True)
+        except TypeError:
+            draw.text((size // 2, size // 2), emoji, font=font,
+                      anchor="mm", fill=(0, 0, 0, 255))
+
+        return ImageTk.PhotoImage(img)
+    except Exception as e:
+        print(f"icon render failed: {e}")
+        return None
+
+
+def _make_scrollable_tab(parent, tab_class, *args, **kwargs):
+    """Wrap a tab class instance in a scrollable CTk container.
+
+    Returns ``(container, tab)``. Mount ``container`` in the content
+    host; ``tab`` is the original tab instance and exposes its full
+    API unchanged.
+
+    Extra positional / keyword arguments are forwarded to ``tab_class``.
+
+    Stock ``CTkScrollableFrame`` only stretches its inner frame
+    horizontally. When the canvas is taller than the content's natural
+    height, the inner frame stays at natural height -- which leaves a
+    gap below and starves any ``ttk.PanedWindow`` inside that wants to
+    fill the tab. We patch around that here by binding ``<Configure>``
+    and stretching the inner frame's *height* to
+    ``max(natural, canvas_height)``. PanedWindows then fill the viewport
+    when there's room, and scrolling kicks in only when content's
+    natural height exceeds the viewport.
+    """
+    container = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+    tab = tab_class(container, *args, **kwargs)
+    tab.pack(fill="both", expand=True)
+
+    # ``_parent_canvas`` and ``_create_window_id`` are CTk-internal, but
+    # they are the only way to reach the canvas and canvas-window to
+    # resize; a CTk rename would break this first.
+    canvas = container._parent_canvas
+    window_id = container._create_window_id
+
+    def _stretch_inner_to_canvas(_event=None):
+        # Fires on canvas resize AND on inner-frame resize (e.g. a
+        # resize-handle drag growing one child), so the canvas window
+        # grows to absorb the new requested height. Without the second
+        # binding the canvas keeps its old fixed height and the new
+        # child just crushes its siblings.
+        if not container.winfo_exists():  # tab replaced mid-event
+            return
+        canvas_h = canvas.winfo_height()
+        natural_h = container.winfo_reqheight()
+        canvas.itemconfigure(window_id, height=max(natural_h, canvas_h))
+
+    # add="+" keeps CTk's own <Configure> handler (its width-stretch).
+    canvas.bind("<Configure>", _stretch_inner_to_canvas, add="+")
+    container.bind("<Configure>", _stretch_inner_to_canvas, add="+")
+
+    # Wheel routing isn't installed here: the app root owns a single
+    # ``install_scroll_router`` that resolves the active tab's wrapper
+    # canvas dynamically, so each tab is automatically covered.
+    return container, tab
+
+
+# ---------------------------------------------------------------------------
+# Sidebar navigation
+# ---------------------------------------------------------------------------
+
+class _Sidebar(ctk.CTkFrame):
+    """Vertical navigation rail of CTkButtons -- one per tab.
+
+    The active tab's button is highlighted via ``fg_color``; inactive
+    buttons render flat against the sidebar background. Selection
+    callback receives the integer index of the clicked tab.
+    """
+
+    def __init__(self, master, labels, on_select, on_open_run=None,
+                 on_import_suite2p=None, width=210):
+        super().__init__(master, width=width, corner_radius=0)
+        self._on_select = on_select
+        # Use the active theme's accent for the highlight.
+        self._active_color = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
+        self._buttons: list[ctk.CTkButton] = []
+
+        title = ctk.CTkLabel(
+            self, text="CalLIOPE",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        title.pack(pady=(16, 4), padx=12)
+        subtitle = ctk.CTkLabel(
+            self, text="pipeline", text_color=("gray60", "gray60"),
+            font=ctk.CTkFont(size=11),
+        )
+        subtitle.pack(pady=(0, 10), padx=12)
+
+        # One-click "open a finished run" entry point. Lives in the
+        # sidebar so it's reachable from every tab, not buried inside one.
+        if on_open_run is not None:
+            ctk.CTkButton(
+                self, text="\U0001F4C2  Open run folder…",
+                height=30, corner_radius=6, command=on_open_run,
+            ).pack(fill="x", padx=8, pady=(0, 4))
+        if on_import_suite2p is not None:
+            ctk.CTkButton(
+                self, text="\U0001F4E5  Import Suite2p output…",
+                height=30, corner_radius=6, command=on_import_suite2p,
+            ).pack(fill="x", padx=8, pady=(0, 4))
+
+        # "Now viewing" indicator -- set by ``set_run_label`` after a run
+        # loads so the user can trust the whole app reflects one run.
+        self._run_label = ctk.CTkLabel(
+            self, text="", text_color=("gray55", "gray55"),
+            font=ctk.CTkFont(size=10), wraplength=190, justify="left",
+        )
+        self._run_label.pack(fill="x", padx=10, pady=(0, 8))
+
+        for idx, text in enumerate(labels):
+            btn = ctk.CTkButton(
+                self, text=text, anchor="w", height=34,
+                corner_radius=6, fg_color="transparent",
+                text_color=("gray10", "gray90"),
+                hover_color=("gray80", "gray25"),
+                # i=idx binds the current index (avoids late-binding).
+                command=lambda i=idx: self._on_select(i),
+            )
+            btn.pack(fill="x", padx=8, pady=2)
+            self._buttons.append(btn)
+
+        # Keep the sidebar at its requested width.
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+    def set_active(self, idx: int) -> None:
+        """Highlight the active tab's button; flatten the rest."""
+        for i, btn in enumerate(self._buttons):
+            if i == idx:
+                btn.configure(fg_color=self._active_color)
+            else:
+                btn.configure(fg_color="transparent")
+
+    def set_run_label(self, text: str) -> None:
+        """Show which run is currently loaded (or '' to clear)."""
+        self._run_label.configure(text=text)
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
+LAST_TAB_FILE = Path.home() / ".calliope" / "last_tab"
+
+
+def _load_last_tab(n_tabs: int, default: int = 1) -> int:
+    """Return the tab index remembered from the last launch, else ``default``."""
+    try:
+        idx = int(LAST_TAB_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return default
+    return idx if 0 <= idx < n_tabs else default
+
+
+def _save_last_tab(idx: int) -> None:
+    """Remember ``idx`` as the tab to open on next launch."""
+    try:
+        LAST_TAB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_TAB_FILE.write_text(str(int(idx)))
+    except OSError:
+        pass  # a read-only home just means no memory of the last tab
+
+
+class PipelineApp(ctk.CTk):
+    """The root window: sidebar plus one scrollable body per tab."""
+
+    APP_NAME = "CalLIOPE"
+    APP_SUBTITLE = "Calcium Live-imaging Output Pipeline for Epileptiform-recordings"
+    APP_EMOJI = "\U0001F3A7"  # headphones codepoint
+
+    # Windows-specific app-id so the taskbar groups our windows under
+    # their own icon instead of folding them into python.exe.
+    APP_USER_MODEL_ID = "calliope.pipeline.1"
+
+    def __init__(self) -> None:
+        """Build the window, shared state, sidebar and all nine tabs."""
+        # Windows groups taskbar icons by AppUserModelID; without this
+        # call the process inherits python.exe's AppID and the taskbar
+        # shows the Python icon regardless of iconphoto. Must run
+        # before any Tk window is created, which is why it sits ahead
+        # of ``super().__init__()``.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    self.APP_USER_MODEL_ID)
+            except Exception as e:
+                print(f"SetCurrentProcessExplicitAppUserModelID failed: {e}")
+
+        super().__init__()
+        self.title(f"{self.APP_EMOJI} {self.APP_NAME} - {self.APP_SUBTITLE}")
+        self.geometry("1280x800")
+        self.minsize(960, 640)
+
+        # Keep a reference: Tk only weakly references PhotoImages.
+        self._icon_photo = _render_emoji_icon(self.APP_EMOJI, size=128)
+        if self._icon_photo is not None:
+            try:
+                # True => default icon for every new window in this process.
+                self.iconphoto(True, self._icon_photo)
+                # CTk checks a private flag and, if ``iconbitmap`` was
+                # never called, force-overrides the window icon with
+                # its bundled ``.ico``. ``iconphoto`` doesn't flip that
+                # flag, so flip it manually here to keep our headphones
+                # emoji on the titlebar.
+                self._iconbitmap_method_called = True
+            except Exception as e:
+                print(f"iconphoto failed: {e}")
+
+        # Shared pub/sub container. Tabs never talk to each other
+        # directly: they publish updates through ``state_obj`` and
+        # subscribe to the channels they care about. Full surface in
+        # ``calliope.gui_common.AppState``.
+        self.state_obj = AppState()
+
+        # Re-skin every ttk widget class so legacy ttk widgets inside
+        # tabs (not yet migrated to CTk) blend with the dark surround
+        # instead of glowing white.
+        apply_ttk_dark_theme(self)
+
+        # Two-pane root: fixed-width sidebar (column 0), growing content (column 1).
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+
+        tab_labels = [
+            "0. Batch runner",
+            "1. Input & Preprocess",
+            "2. QC Preview",
+            "3. Suite2p Detection",
+            "4. Low-pass filter",
+            "5. Event detection",
+            "6. Clustering",
+            "7. Cross-correlation",
+            "8. Spatial propagation",
+        ]
+        self._sidebar = _Sidebar(self, labels=tab_labels,
+                                 on_select=self._on_sidebar_select,
+                                 on_open_run=self._on_open_run,
+                                 on_import_suite2p=self._on_import_suite2p)
+        self._sidebar.grid(row=0, column=0, sticky="nsw")
+
+        # Content host: every tab body is grided into row 0 / col 0 of
+        # this frame. ``_show_tab`` hides the outgoing one and reveals
+        # the incoming one -- only one body is mapped at a time, which
+        # is what fires the ``on_tab_shown`` / ``on_tab_hidden`` hooks.
+        self._content = ctk.CTkFrame(self, corner_radius=0,
+                                     fg_color="transparent")
+        self._content.grid(row=0, column=1, sticky="nsew")
+        self._content.grid_rowconfigure(0, weight=1)
+        self._content.grid_columnconfigure(0, weight=1)
+
+        # Tabs are built eagerly so their AppState subscriptions exist
+        # from the start. ``container`` is what gets gridded / ungridded;
+        # ``tab`` is the tab instance itself.
+        tab_classes = [
+            BatchTab, PreprocessTab, QcTab, Suite2pTab, LowpassTab,
+            EventDetectionTab, ClusteringTab, CrossCorrelationTab,
+            SpatialPropagationTab,
+        ]
+        self._tabs_in_order: list = []
+        self._tab_containers: list = []
+        for cls in tab_classes:
+            container, tab = _make_scrollable_tab(
+                self._content, cls, self.state_obj)
+            self._tabs_in_order.append(tab)
+            self._tab_containers.append(container)
+
+        # Named handles (same order as ``tab_classes``) so other code,
+        # e.g. the batch tab, can reach individual tabs.
+        (self.batch_tab, self.preprocess_tab, self.qc_tab,
+         self.detection_tab, self.lowpass_tab, self.event_tab,
+         self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
+            self._tabs_in_order
+
+        # ``-1`` is the "no tab is shown yet" sentinel. Open on the tab the
+        # user last picked, Tab 1 on first launch.
+        self._current_tab_index = -1
+        self._show_tab(_load_last_tab(len(self._tab_containers)))
+
+        # Single mouse-wheel router for the whole app. The fallback
+        # canvas is resolved dynamically per event to the currently
+        # visible tab's wrapper canvas -- so the wheel scrolls inner
+        # consoles / listboxes / row canvases when the cursor is over
+        # them, and falls through to scrolling the whole tab otherwise.
+        # Popouts install their own routers (no fallback) so they
+        # don't accidentally scroll the main window behind them.
+        install_scroll_router(
+            self, fallback_canvas=self._current_tab_canvas)
+
+    def _current_tab_canvas(self):
+        """Return the visible tab's wrapper canvas (the scrollable
+        target for the app-wide wheel router's fallback path), or
+        ``None`` if nothing is mapped yet."""
+        idx = self._current_tab_index
+        if 0 <= idx < len(self._tab_containers):
+            return self._tab_containers[idx]._parent_canvas
+        return None
+
+    def _on_sidebar_select(self, idx: int) -> None:
+        """Sidebar click: show the tab and remember it for next launch.
+        Programmatic switches (batch runner, Open run folder) aren't saved."""
+        self._show_tab(idx)
+        _save_last_tab(idx)
+
+    def _show_tab(self, idx_or_widget) -> None:
+        """Activate the tab at ``idx_or_widget`` (int index OR tab
+        instance / container).
+
+        Callers normally pass an int index; a tab instance or its
+        container is also accepted.
+
+        Fires ``on_tab_hidden`` on the outgoing tab and ``on_tab_shown``
+        on the incoming one (both optional). Tabs use those hooks for
+        cheap on-show refreshes (e.g. re-reading the working directory
+        if Tab 1 might have changed it).
+        """
+        if isinstance(idx_or_widget, int):
+            idx = idx_or_widget
+        else:
+            try:
+                idx = self._tabs_in_order.index(idx_or_widget)
+            except ValueError:
+                idx = self._tab_containers.index(idx_or_widget)
+        if not 0 <= idx < len(self._tab_containers):
+            return
+        if idx == self._current_tab_index:
+            return
+        # Hide outgoing.
+        if 0 <= self._current_tab_index < len(self._tab_containers):
+            old_container = self._tab_containers[self._current_tab_index]
+            old_tab = self._tabs_in_order[self._current_tab_index]
+            old_container.grid_forget()
+            # Hooks are optional; not every tab implements them.
+            on_hidden = getattr(old_tab, "on_tab_hidden", None)
+            if callable(on_hidden):
+                try:
+                    on_hidden()
+                except Exception as e:
+                    # Swallow hook errors so one misbehaving tab can't
+                    # wedge the whole app.
+                    print(
+                        f"on_tab_hidden({type(old_tab).__name__}) failed: {e}")
+        # Show incoming.
+        new_container = self._tab_containers[idx]
+        new_tab = self._tabs_in_order[idx]
+        new_container.grid(row=0, column=0, sticky="nsew")
+        self._sidebar.set_active(idx)
+        self._current_tab_index = idx
+        on_shown = getattr(new_tab, "on_tab_shown", None)
+        if callable(on_shown):
+            try:
+                on_shown()
+            except Exception as e:
+                print(f"on_tab_shown({type(new_tab).__name__}) failed: {e}")
+
+    # -- Open a finished run -------------------------------------------------
+
+    def _rebuild_analysis_tabs(self) -> None:
+        """Destroy and recreate Tabs 1-8 so nothing drawn for the previous
+        recording survives into the next: a stage the new
+        run lacks then shows an empty tab, not the old recording.
+        Tab 0 (batch queue) is kept; it only subscribes during a run."""
+        self.state_obj.release_memmaps()
+        self.state_obj.clear_listeners()
+        if self._current_tab_index > 0:
+            self._current_tab_index = -1  # outgoing container is destroyed
+        for i in range(1, len(self._tabs_in_order)):
+            cls = type(self._tabs_in_order[i])
+            old = self._tab_containers[i]
+            # CTkScrollableFrame.destroy() removes only the inner frame; its
+            # outer frame and canvas (with <Configure> callbacks that touch
+            # the inner frame) would survive, raising TclErrors and keeping
+            # the old tab alive. Destroying the outer frame takes all three.
+            getattr(old, "_parent_frame", old).destroy()
+            container, tab = _make_scrollable_tab(
+                self._content, cls, self.state_obj)
+            self._tabs_in_order[i] = tab
+            self._tab_containers[i] = container
+        (self.batch_tab, self.preprocess_tab, self.qc_tab,
+         self.detection_tab, self.lowpass_tab, self.event_tab,
+         self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
+            self._tabs_in_order
+
+    def _on_import_suite2p(self) -> None:
+        """Build a CalLIOPE run from an existing Suite2p result (a plane0
+        folder, picked via its ops.npy, or a Fall.mat), then open it like
+        "Open run folder". The conversion, dF/F and
+        cell filter run in a child process."""
+        import queue
+        from tkinter import filedialog, messagebox
+        from .core import suite2p_import
+        from .core.offload import run_offloaded
+        from .gui_common import drain_queue
+
+        src = filedialog.askopenfilename(
+            title="Pick a Suite2p Fall.mat, or ops.npy inside a plane0 folder",
+            filetypes=[("Suite2p output", "Fall.mat ops.npy *.mat"),
+                       ("All files", "*.*")])
+        if not src:
+            return
+        src_p = Path(src)
+        if src_p.name.lower() == "ops.npy":
+            src_p = src_p.parent
+            name = (src_p.parent.parent.name if src_p.name == "plane0"
+                    else src_p.name)
+        else:
+            name = src_p.parent.name
+        dest = filedialog.askdirectory(
+            title="Where should the CalLIOPE run folder be created?")
+        if not dest:
+            return
+        run = Path(dest) / f"{name or 'suite2p'}_calliope"
+        if run.exists() and any(run.iterdir()):
+            messagebox.showerror(
+                "Folder exists", f"{run} already exists and is not empty.")
+            return
+        self._sidebar.set_run_label(f"Importing {src_p.name}…")
+        q: queue.Queue = queue.Queue()
+
+        def _failed(msg):
+            self._sidebar.set_run_label("")
+            messagebox.showerror("Import failed", str(msg).split("\n")[0])
+
+        drain_queue(self, q, {
+            "done": lambda p: self._on_open_run(Path(p)),
+            "error": _failed,
+            "progress": lambda m: print(m)}, poll_ms=200)
+        run_offloaded(self, q, suite2p_import.import_suite2p,
+                      args=(str(src_p), str(run)),
+                      kwargs={"ckpt_path": str(
+                          self.detection_tab.DEFAULT_CKPT_PATH)})
+
+    def _on_open_run(self, folder=None) -> None:
+        """Point the whole app at one finished recording folder and
+        repopulate every tab in dependency order, without rerunning the
+        pipeline.
+
+        Most stages rehydrate by republishing their AppState channel from
+        files on disk. The exception is event detection: its
+        ``event_results`` payload is never persisted, so it is recomputed
+        from the lowpass memmaps -- using the *saved* params from the run
+        manifest, not whatever is currently in the GUI, so the reloaded
+        events match the original run.
+        """
+        from tkinter import filedialog, messagebox
+        from .core import run_loader
+
+        if folder is None:
+            folder = filedialog.askdirectory(
+                title="Select a CalLIOPE run (recording) folder")
+        if not folder:
+            return
+        run_folder = Path(folder)
+        inv = run_loader.scan_run(run_folder)
+        if not inv.any_stage:
+            messagebox.showwarning(
+                "Nothing to load",
+                f"{run_folder} doesn't look like a CalLIOPE run -- no "
+                f"qc.gif / mean.npy and no "
+                f"detection/final/suite2p/plane0 outputs found.")
+            return
+        if getattr(self.batch_tab, "_batch_active", False):
+            messagebox.showinfo(
+                "Batch running",
+                "A batch is running. Wait for it to finish (or abort it) "
+                "before opening another run folder.")
+            return
+
+        # Start from a clean bus and fresh tabs so a stage missing from
+        # this run can't inherit the previous run's value or drawing.
+        self.state_obj.reset()
+        self._rebuild_analysis_tabs()
+        params = run_loader.manifest_params(run_folder)
+        loaded: list[str] = []
+        skipped: list[str] = []
+
+        # 1. Preprocess / QC. regenerate_shifted=False keeps this fast:
+        #    a finished run has had its shifted TIFF archived away, and
+        #    regenerating it from the compressed raw is a multi-GB,
+        #    multi-minute operation that would freeze the UI -- and
+        #    viewing never needs it (only re-detecting does).
+        if inv.has_preprocess:
+            try:
+                from .core import preprocessing
+                result = preprocessing.load_existing_preprocess(
+                    str(run_folder), regenerate_shifted=False)
+                if result is not None:
+                    self.state_obj.set_result(result)
+                    loaded.append("QC movie + mean image")
+                else:
+                    skipped.append("QC (couldn't parse preprocess outputs)")
+            except Exception as e:
+                skipped.append(f"QC ({e})")
+        else:
+            skipped.append("QC (no qc.gif / mean.npy)")
+
+        # 2. Detection -- publishing plane0 lights Tabs 4-7, which all
+        #    subscribe to this channel directly. Tab 3 itself *produces*
+        #    plane0 rather than subscribing, so publishing alone leaves
+        #    its own panels blank; render them here so the user doesn't
+        #    have to click "Load existing panels" after every reload.
+        if inv.has_detection:
+            self.state_obj.set_plane0(inv.plane0)
+            loaded.append("detection (ROIs + traces)")
+            try:
+                self.detection_tab._final_plane0 = inv.plane0
+                self.detection_tab._draw_panels(inv.plane0)
+                self.detection_tab.status_var.set(f"Loaded -> {inv.plane0}")
+            except Exception as e:
+                skipped.append(f"detection panels ({e})")
+        else:
+            skipped.append("detection (no plane0 F.npy / stat.npy)")
+
+        # 3. Lowpass. Tab 5 keys off plane0 + its own memmap check, but
+        #    publish this too for anything listening on the channel.
+        if inv.has_lowpass:
+            self.state_obj.set_lowpass_ready(inv.plane0)
+            loaded.append("lowpass + derivative")
+        else:
+            skipped.append("lowpass (filtered memmaps absent)")
+
+        # 4. Event detection -- the one channel never persisted to disk,
+        #    so recompute from the saved params.
+        if inv.has_lowpass:
+            had_params = self._rehydrate_events(params)
+            loaded.append(
+                "events (recomputed from saved params)" if had_params
+                else "events (recomputed, DEFAULT params -- see warning)")
+        else:
+            skipped.append("events (needs lowpass)")
+
+        # 5/6. Clusters + xcorr -- best effort via each tab's own reload,
+        #      which re-reads its files now that plane0 is published.
+        if inv.has_clusters:
+            try:
+                self.clustering_tab._on_reload_clusters()
+                loaded.append("clusters")
+            except Exception as e:
+                skipped.append(f"clusters ({e})")
+        if inv.has_xcorr:
+            try:
+                self.xcorr_tab._on_reload_inputs()
+                loaded.append("cross-correlation inputs")
+            except Exception as e:
+                skipped.append(f"cross-correlation ({e})")
+
+        # Trust signals: a persistent "now viewing" label, land on the
+        # first stage that actually loaded (QC, else detection).
+        self._sidebar.set_run_label(f"▶ {run_folder.name}")
+        self._show_tab(2 if inv.has_preprocess else 3)
+        self._report_open_run(run_folder, inv, params, loaded, skipped)
+
+    def _rehydrate_events(self, params: dict) -> bool:
+        """Restore Tab 5's params from the manifest, then recompute.
+
+        Returns ``True`` if any event-detection params were found in the
+        manifest. ``False`` means the recompute fell back to defaults
+        (the caller surfaces this as a data-integrity warning).
+        """
+        ev = self.event_tab
+        params = params or {}
+        spec_keys = {s["name"] for s in ev.PARAM_SPEC}
+        had_params = bool(set(params) & spec_keys)
+        # Same public seam Tab 0's batch runner uses: applies the
+        # PARAM_SPEC keys plus the manual-subset / onset-source Tk vars
+        # the render path snapshots (else they'd revert to GUI defaults).
+        self._rehydrate_error = None
+        try:
+            ev.apply_batch_row(params)
+        except Exception as e:
+            # Don't block the reload, but don't claim the saved params
+            # were used either: report it and fall back to "defaults".
+            print(f"[open run] could not apply saved event params: {e}")
+            self._rehydrate_error = str(e)
+            had_params = False
+        # Don't let the reload's own recompute write params back to the
+        # manifest -- we'd either rewrite what we just read or, if none
+        # were found, record GUI defaults as the run's real settings.
+        ev._suppress_manifest_write = True
+        # Async: publishes set_event_results when the worker finishes.
+        ev._on_render()
+        return had_params
+
+    @staticmethod
+    def _keep_mask_drift_warning(plane0) -> list[str]:
+        """Warn when Tab 3's kept-ROI count won't match the rest of the app.
+
+        Tab 3 paints the live cell-filter mask; every downstream stage
+        reads the filtered memmaps, which are frozen to the mask that was
+        live when they were written (``r0p7_cell_mask_bool.npy``).
+        Re-running the cell filter afterwards moves one and not the
+        other. Returns ``[]`` when there is no frozen mask yet, when
+        either mask doesn't match this run's ROI count, or on any read
+        error -- a malformed file must never block opening a run. Equal
+        counts don't guarantee identical ROI membership; differing
+        counts do mean the filtered outputs are stale.
+        """
+        try:
+            import numpy as np
+            from .core import utils
+            plane0 = Path(plane0)
+            if not (plane0 / "r0p7_cell_mask_bool.npy").exists():
+                return []
+            n_total = len(np.load(plane0 / "stat.npy", allow_pickle=True))
+            pipe_n = utils.pipeline_mask_count(plane0, n_total)
+            live = np.asarray(utils.resolve_live_mask(plane0, n_total))
+            if pipe_n is None or live.size != n_total:
+                return []
+            live_n = int(live.astype(bool).sum())
+        except Exception:
+            return []
+        if pipe_n == live_n:
+            return []
+        return [f"The cell filter now keeps {live_n} ROIs, but the filtered "
+                f"dF/F this run's lowpass / events / clusters / figures are "
+                f"built from holds {pipe_n}. Tab 3 shows {live_n}; everything "
+                f"else shows {pipe_n}. Re-run Tab 3's 'Filtered dF/F' (and "
+                f"the stages after it) to make them agree."]
+
+    def _calliope_git_sha(self) -> Optional[str]:
+        """Return the running CalLIOPE git SHA, or None if unavailable."""
+        try:
+            from .core.export_manifest import _git_sha
+            return _git_sha(Path(__file__).resolve().parent)
+        except Exception:
+            return None
+
+    def _report_open_run(self, run_folder, inv, params, loaded, skipped):
+        """Summarise what loaded + surface provenance/integrity warnings."""
+        from tkinter import messagebox
+
+        lines = [f"Loaded run: {run_folder.name}", ""]
+        if loaded:
+            lines.append("Restored:")
+            lines += [f"  • {x}" for x in loaded]
+        if skipped:
+            lines.append("")
+            lines.append("Not loaded:")
+            lines += [f"  • {x}" for x in skipped]
+
+        warns: list[str] = []
+        rehydrate_err = getattr(self, "_rehydrate_error", None)
+        if rehydrate_err:
+            warns.append(
+                f"The run's saved event-detection parameters could not be "
+                f"applied ({rehydrate_err}), so events may have been "
+                f"recomputed with other settings than the original run.")
+        spec_keys = {s["name"] for s in self.event_tab.PARAM_SPEC}
+        if inv.has_lowpass and not (set(params or {}) & spec_keys):
+            warns.append(
+                "Event-detection parameters were not found in this run's "
+                "manifest, so events were recomputed with DEFAULT settings "
+                "and may differ from the original run.")
+        man_sha = (inv.manifest or {}).get("calliope_git_sha")
+        cur_sha = self._calliope_git_sha()
+        if man_sha and cur_sha and man_sha != cur_sha:
+            warns.append(
+                f"This run was produced by a different CalLIOPE version "
+                f"(manifest {man_sha[:8]} vs running {cur_sha[:8]}); "
+                f"recomputed stages may not match the saved figures/CSVs.")
+        if inv.has_detection:
+            warns += self._keep_mask_drift_warning(inv.plane0)
+        if warns:
+            lines.append("")
+            lines.append("⚠ Heads up:")
+            lines += [f"  • {w}" for w in warns]
+
+        messagebox.showinfo("Open run", "\n".join(lines))
+
+
+def main() -> None:
+    """Entrypoint: instantiate the app and start the event loop.
+
+    The appearance calls must run before any CTk widget is created.
+    ``mainloop()`` blocks until the window is closed.
+    """
+    # Heavy compute runs in spawned child processes (core.offload);
+    # freeze_support() is a no-op when running from source.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    PipelineApp().mainloop()
+
+
+if __name__ == "__main__":
+    main()
