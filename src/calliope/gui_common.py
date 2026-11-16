@@ -800,16 +800,38 @@ class AdvancedDialog(ctk.CTkToplevel):
         self._defaults = {s["name"]: s["default"] for s in specs}
         # Filled by ``_add_field``: spec name -> (Tk Var, spec dict).
         self._vars: dict = {}
+        self._entries: list = []     # text fields, for initial focus
         self._accepted = False
 
         self._build_ui()
-        # Modal: capture input until the dialog closes.
-        self.grab_set()
+        # Make the dialog modal once it is on screen: grabbing (and
+        # focusing) before the window is mapped can leave keyboard input
+        # with the main window on macOS, so fields look fine but ignore
+        # typing.
+        self.after(100, self._activate)
         # The window-manager close button cancels.
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
         # Route wheel events to the inner CTkScrollableFrame; no
         # fallback since the dialog itself isn't scrollable.
         install_scroll_router(self)
+
+    def _activate(self) -> None:
+        """Raise, focus and grab the dialog once it is viewable, then put
+        the cursor in the first text field."""
+        if not self.winfo_exists():
+            return
+        if not self.winfo_viewable():
+            self.after(100, self._activate)
+            return
+        self.lift()
+        self.focus_force()
+        try:
+            self.grab_set()
+        except tk.TclError:          # another grab still active; retry
+            self.after(100, self._activate)
+            return
+        if self._entries:
+            self._entries[0].focus_set()
 
     def _build_ui(self) -> None:
         """Lay out the scrollable form (one framed section per group) and
@@ -868,8 +890,9 @@ class AdvancedDialog(ctk.CTkToplevel):
         else:
             # int / float / str all use an Entry; ``_coerce`` converts back.
             var = tk.StringVar(value=str(cur))
-            ctk.CTkEntry(parent, textvariable=var).grid(
-                row=row, column=1, sticky="ew", pady=2)
+            entry = ctk.CTkEntry(parent, textvariable=var)
+            entry.grid(row=row, column=1, sticky="ew", pady=2)
+            self._entries.append(entry)
 
         # Optional help text shown to the right of the input.
         help_text = spec.get("help")
@@ -924,6 +947,21 @@ class AdvancedDialog(ctk.CTkToplevel):
         """Close without changing ``current``."""
         self.grab_release()
         self.destroy()
+
+
+def wrap_to_width(label) -> None:
+    """Keep a packed/gridded ``CTkLabel`` wrapping at its current width,
+    so long text wraps instead of running under neighbouring widgets on
+    small screens. CTk scales ``wraplength``, so the pixel width is
+    converted back to unscaled units.
+
+    Binds the outer frame (sized by the layout), not CTkLabel.bind's
+    inner label (sized by its text), so re-wrapping can't feed back."""
+    def _on_configure(e):
+        wl = max(100, int(e.width / label._get_widget_scaling()) - 16)
+        if wl != label.cget("wraplength"):
+            label.configure(wraplength=wl)
+    tk.Misc.bind(label, "<Configure>", _on_configure, add="+")
 
 
 def spec_defaults(specs: list[dict]) -> dict:
