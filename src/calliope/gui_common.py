@@ -786,14 +786,17 @@ class AdvancedDialog(ctk.CTkToplevel):
     user clicks OK; ``open_advanced`` returns whether that happened.
     """
 
+    FIELD_W = 140     # unscaled width of every entry / combobox
+
     def __init__(self, master, title: str, specs: list[dict],
                  current: dict) -> None:
         super().__init__(master)
         self.title(title)
         self.transient(master)
         self.resizable(True, True)
-        self.geometry("560x600")
-        self.wm_minsize(440, 400)
+        # Fits a 14-inch laptop (~1280x720 usable at 150% scaling).
+        self.geometry("720x600")
+        self.wm_minsize(460, 320)
         # _defaults lets the Reset button restore fields by spec name.
         self._specs = specs
         self._current = current
@@ -814,6 +817,28 @@ class AdvancedDialog(ctk.CTkToplevel):
         # Route wheel events to the inner CTkScrollableFrame; no
         # fallback since the dialog itself isn't scrollable.
         install_scroll_router(self)
+
+    def _fit_columns(self, frame, width: int) -> None:
+        """Size one group's columns from its width: the field column is
+        fixed, labels get ~40% of the rest (at least 130 px) and help text
+        the remainder, both wrapping. Widths come from the layout, not the
+        text, so the field column can never be squeezed out at narrow
+        widths."""
+        s = frame._get_widget_scaling()
+        field_px = int((self.FIELD_W + 8) * s)
+        rest = max(0, width - field_px - int(32 * s))
+        label_px = max(int(130 * s), int(rest * 0.4))
+        help_px = max(int(60 * s), rest - label_px)
+        if getattr(frame, "_fit", None) == (label_px, help_px):
+            return
+        frame._fit = (label_px, help_px)
+        frame.columnconfigure(0, minsize=label_px, weight=0)
+        frame.columnconfigure(1, minsize=field_px, weight=0)
+        frame.columnconfigure(2, minsize=help_px, weight=0)
+        for lab in frame._labels:
+            lab.configure(wraplength=max(40, label_px / s - 16))
+        for hl in frame._helps:
+            hl.configure(wraplength=max(40, help_px / s - 32))
 
     def _activate(self) -> None:
         """Raise, focus and grab the dialog once it is viewable, then put
@@ -852,7 +877,9 @@ class AdvancedDialog(ctk.CTkToplevel):
                              font=ctk.CTkFont(weight="bold")).grid(
                     row=0, column=0, columnspan=3, sticky="w",
                     padx=8, pady=(6, 4))
-                lf.columnconfigure(1, weight=1)
+                lf._labels, lf._helps = [], []
+                lf.bind("<Configure>",
+                        lambda e, f=lf: self._fit_columns(f, e.width))
                 groups[grp] = (lf, 1)
             lf, row = groups[grp]
             self._add_field(lf, row, spec)
@@ -873,8 +900,9 @@ class AdvancedDialog(ctk.CTkToplevel):
         help text. The widget type depends on ``spec["type"]``."""
         name = spec["name"]
         label = spec.get("label", name)
-        ctk.CTkLabel(parent, text=label, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=(8, 8), pady=2)
+        lab = ctk.CTkLabel(parent, text=label, anchor="w", justify="left")
+        lab.grid(row=row, column=0, sticky="w", padx=(8, 8), pady=2)
+        parent._labels.append(lab)
         # Pre-fill from ``current`` if present, else the spec default.
         cur = self._current.get(name, spec["default"])
 
@@ -885,22 +913,27 @@ class AdvancedDialog(ctk.CTkToplevel):
         elif spec["type"] == "choice":
             var = tk.StringVar(value=str(cur))
             cb = ctk.CTkComboBox(parent, variable=var, state="readonly",
+                                 width=self.FIELD_W,
                                  values=list(spec.get("choices", [])))
-            cb.grid(row=row, column=1, sticky="ew", pady=2)
+            cb.grid(row=row, column=1, sticky="w", pady=2)
         else:
             # int / float / str all use an Entry; ``_coerce`` converts back.
             var = tk.StringVar(value=str(cur))
-            entry = ctk.CTkEntry(parent, textvariable=var)
-            entry.grid(row=row, column=1, sticky="ew", pady=2)
+            entry = ctk.CTkEntry(parent, textvariable=var,
+                                 width=self.FIELD_W)
+            entry.grid(row=row, column=1, sticky="w", pady=2)
             self._entries.append(entry)
 
-        # Optional help text shown to the right of the input.
+        # Optional help text to the right of the input, wrapped by
+        # ``_fit_columns`` so it never claims the field's width.
         help_text = spec.get("help")
         if help_text:
-            ctk.CTkLabel(parent, text=help_text, text_color="gray",
-                         font=ctk.CTkFont(size=11, slant="italic"),
-                         anchor="w").grid(
-                row=row, column=2, sticky="w", padx=(8, 8), pady=2)
+            hl = ctk.CTkLabel(parent, text=help_text, text_color="gray",
+                              font=ctk.CTkFont(size=11, slant="italic"),
+                              anchor="w", justify="left",
+                              padx=4)   # room for the italic overhang
+            hl.grid(row=row, column=2, sticky="w", padx=(8, 8), pady=2)
+            parent._helps.append(hl)
 
         self._vars[name] = (var, spec)
 
