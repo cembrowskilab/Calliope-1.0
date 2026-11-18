@@ -56,7 +56,7 @@ the paper exactly, `pip install cellpose==4.1.1`. Each detection run
 records the cellpose version and model in its final `ops.npy` under
 `cellpose_passes`.
 
-`requirements.txt` installs the CPU build of PyTorch on Windows and
+`requirements.txt` installs a PyTorch build without CUDA on Windows and
 macOS. For NVIDIA GPU acceleration, the optional NWB export, a `uv` or
 conda install, see [docs/install.md](docs/install.md).
 
