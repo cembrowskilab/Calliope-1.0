@@ -45,14 +45,16 @@ The first line must use Python 3.11 or 3.12. On Windows,
 `py -3.12 -m venv venv` picks it explicitly. Check with
 `python --version` after activating.
 
-**Cellpose version.** `requirements.txt` pins cellpose 4.1.1, the version
-CalLIOPE 1.0 and its manuscript were validated on; it segments with the
-`cpsam` model. Installs that resolve from `pyproject.toml` alone
-(`pip install -e .`, uv, conda) can get cellpose 4.2 or later, which
+**Cellpose version.** `requirements.txt` and `uv sync` (via `uv.lock`)
+pin cellpose 4.1.1, the version CalLIOPE 1.0 and its manuscript were
+validated on; it segments with the `cpsam` model. Unlocked installs that
+resolve from `pyproject.toml` (`pip install -e .` with dependencies, the
+conda route, `uv pip install -e .`) can get cellpose 4.2 or later, which
 segments with `cpsam_v2` instead. CalLIOPE runs with either, but
 `cpsam_v2` masks have not been compared with `cpsam` ones. To reproduce
-the paper exactly, `pip install cellpose==4.1.1`. Each run records the
-cellpose version and model in `ops.npy` under `cellpose_config`.
+the paper exactly, `pip install cellpose==4.1.1`. Each detection run
+records the cellpose version and model in its final `ops.npy` under
+`cellpose_passes`.
 
 `requirements.txt` installs the CPU build of PyTorch on Windows and
 macOS. For NVIDIA GPU acceleration, the optional NWB export, a `uv` or
