@@ -1016,6 +1016,7 @@ class EventDetectionTab(ctk.CTkFrame):
             in_seconds=True,
             roi_ids=data.get("kept_idx"),
             event_classes=data.get("event_class"),
+            generation=data.get("generation"),
         )
         # Stamp the EventMonotonicity sheet from the per-event
         # Spearman scalars ``run_event_detection`` already computed
@@ -1155,6 +1156,18 @@ class EventDetectionTab(ctk.CTkFrame):
             return
 
         if which == "heatmap":
+            from ...core import generation
+            try:
+                current = generation.check_lowpass(self._plane0)
+            except generation.StaleOutputError as e:
+                current = e
+            if current != data.get("generation"):
+                messagebox.showerror(
+                    "Export failed",
+                    f"The low-pass traces changed since this render "
+                    f"({current}). Re-run Tab 4 if asked, then Render.",
+                    parent=parent)
+                return
             lp_path = (self._plane0
                        / "r0p7_filtered_dff_lowpass.memmap.float32")
             if not lp_path.exists():
