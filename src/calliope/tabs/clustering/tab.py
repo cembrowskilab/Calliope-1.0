@@ -723,6 +723,7 @@ class ClusteringTab(ctk.CTkFrame):
         self._Z = data["Z"]
         self._roi_ids = np.asarray(data["roi_ids"], dtype=int)
         self._linkage_plane0 = plane0
+        self._cluster_inputs = data.get("inputs")
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(np.max(self._Z[:, 2]))
@@ -787,6 +788,7 @@ class ClusteringTab(ctk.CTkFrame):
         self._Z = data["Z"]
         self._roi_ids = np.asarray(data["roi_ids"], dtype=int)
         self._linkage_plane0 = plane0
+        self._cluster_inputs = data.get("inputs")
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(data["zmax"])
@@ -1468,6 +1470,15 @@ class ClusteringTab(ctk.CTkFrame):
                 f"filtered dF/F changed since this clustering ran). "
                 f"Re-run clustering, then export.")
 
+        from ...core import generation, utils as _cu
+        inputs = generation.cluster_input(
+            self._plane0, _cu.is_filtered_prefix(self._prefix))
+        made_from = getattr(self, "_cluster_inputs", None)
+        if made_from is not None and made_from != inputs:
+            raise ValueError(
+                "The dF/F changed since this clustering ran (a rebuild or "
+                "a new cell set). Re-run clustering, then export.")
+
         out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Clear stale C*_rois.npy first so old runs don't poison crosscorr.
@@ -1484,9 +1495,7 @@ class ClusteringTab(ctk.CTkFrame):
         # Marker: the .npy files hold Suite2p ROI indices directly, so the
         # cross-correlation runner skips filtered-position translation.
         (out_dir / "_indices_are_suite2p").write_text("1")
-        from ...core import generation, utils as _cu
-        generation.stamp_clusters(out_dir, generation.cluster_input(
-            self._plane0, _cu.is_filtered_prefix(self._prefix)))
+        generation.stamp_clusters(out_dir, inputs)
         return out_dir
 
     def _on_export(self) -> None:
