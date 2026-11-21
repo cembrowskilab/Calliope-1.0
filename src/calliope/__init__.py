@@ -45,4 +45,4 @@ next.
 # calliope.__version__``. The leading/trailing underscores are not
 # magic -- they are just part of the name. (R's analog is the
 # ``DESCRIPTION`` file's ``Version:`` field.)
-__version__ = "1.0.0"
+__version__ = "1.0.3"

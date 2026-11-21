@@ -21,7 +21,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "calliope"
-version = "1.0.0"
+version = "1.0.3"
 description = "Calcium Live-imaging Output Pipeline for Epileptiform-recordings (CalLIOPE): a desktop GUI for Suite2p-based two-photon calcium-imaging analysis, from raw TIFFs to events, clusters and propagation maps."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
